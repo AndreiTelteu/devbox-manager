@@ -61,7 +61,8 @@ and expect `[]`. No emojis, drawn SVG icons only, English UI copy.
 
 ## mgmt facts
 
-Installed binary targets mgmt 0.0.26 (`mgmt run --tmp-prefix lang <file.mcl>`);
+Installed binary targets mgmt 1.1.0 at `/home/andrei/.local/bin/mgmt`
+(`mgmt run --tmp-prefix lang <file.mcl>`);
 MCL there **requires trailing commas** on attribute lines. The Builder preserves
 unrecognised MCL verbatim as raw nodes; known resource kinds are
 pkg/file/exec/svc/noop/print/void. Recipe runs honor `-max-runtime N` (CLI) and
