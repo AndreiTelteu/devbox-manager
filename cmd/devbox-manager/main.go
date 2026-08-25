@@ -1,3 +1,19 @@
+// devbox-manager: mgmt · MCL recipe manager
+// Copyright (C) 2026  Andrei
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
 package main
 
 import (
@@ -55,7 +71,7 @@ func run(ctx context.Context, args []string) error {
 	}
 }
 func usage() error {
-	return errors.New("usage: devbox-manager serve [-addr :8080] | service <install|status|restart> | server <list|create|update|delete> | recipe <list|create|update|delete|run>")
+	return errors.New("usage: devbox-manager serve [-addr :8080] | service <install|status|start|stop|restart|enable|disable|config> | server <list|create|update|delete> | recipe <list|create|update|delete|run>")
 }
 
 //go:embed web
@@ -105,7 +121,7 @@ const serviceName = "devbox-manager.service"
 
 func service(args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: devbox-manager service <install|status|restart|config host <host>>")
+		return errors.New("usage: devbox-manager service <install|status|start|stop|restart|enable|disable|config host <host>>")
 	}
 	switch args[0] {
 	case "install":
@@ -166,12 +182,20 @@ WantedBy=default.target
 		return systemctl("status", "--no-pager", serviceName)
 	case "status":
 		return systemctl("status", "--no-pager", serviceName)
+	case "start":
+		return systemctl("start", serviceName)
+	case "stop":
+		return systemctl("stop", serviceName)
 	case "restart":
 		return systemctl("restart", serviceName)
+	case "enable":
+		return systemctl("enable", serviceName)
+	case "disable":
+		return systemctl("disable", serviceName)
 	case "config":
 		return serviceConfig(args[1:])
 	default:
-		return errors.New("usage: devbox-manager service <install|status|restart|config host <host>>")
+		return errors.New("usage: devbox-manager service <install|status|start|stop|restart|enable|disable|config host <host>>")
 	}
 }
 
@@ -356,6 +380,7 @@ func recipe(ctx context.Context, s *devbox.Store, args []string) error {
 		mgmt := fs.String("mgmt", "mgmt", "path to mgmt executable")
 		mgmtSeeds := fs.String("mgmt-seeds", "http://127.0.0.1:2379", "existing Mgmt etcd endpoint; empty starts an isolated embedded etcd")
 		convergedTimeout := fs.Int("converged-timeout", 2, "seconds Mgmt must be converged before this one-shot run exits (0 disables)")
+		maxRuntime := fs.Int("max-runtime", 0, "seconds before mgmt exits this run (0 disables)")
 		if e := fs.Parse(args[1:]); e != nil {
 			return e
 		}
@@ -366,7 +391,7 @@ func recipe(ctx context.Context, s *devbox.Store, args []string) error {
 		if *serverID > 0 {
 			sp = serverID
 		}
-		v, e := (devbox.Runner{Store: s, Executable: *mgmt, Seeds: *mgmtSeeds, ConvergedTimeout: *convergedTimeout}).Run(ctx, *id, sp)
+		v, e := (devbox.Runner{Store: s, Executable: *mgmt, Seeds: *mgmtSeeds, ConvergedTimeout: *convergedTimeout}).Run(ctx, *id, sp, *maxRuntime)
 		if e != nil {
 			return e
 		}

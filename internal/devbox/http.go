@@ -1,3 +1,19 @@
+// devbox-manager: mgmt · MCL recipe manager
+// Copyright (C) 2026  Andrei
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
 package devbox
 
 import (
@@ -185,7 +201,8 @@ func (a API) deleteRecipe(w http.ResponseWriter, r *http.Request) {
 }
 
 type runRequest struct {
-	ServerID *int64 `json:"server_id"`
+	ServerID   *int64 `json:"server_id"`
+	MaxRuntime int    `json:"max_runtime"`
 }
 
 func (a API) runRecipe(w http.ResponseWriter, r *http.Request) {
@@ -198,7 +215,11 @@ func (a API) runRecipe(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &req) {
 		return
 	}
-	v, e := a.Runner.Run(r.Context(), x, req.ServerID)
+	if req.MaxRuntime < 0 || req.MaxRuntime > 24*60*60 {
+		respond(w, 400, map[string]string{"error": "max_runtime must be between 0 and 86400 seconds"})
+		return
+	}
+	v, e := a.Runner.Run(r.Context(), x, req.ServerID, req.MaxRuntime)
 	if e != nil {
 		errorResponse(w, e)
 		return
