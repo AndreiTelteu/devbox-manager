@@ -1,0 +1,9 @@
+# Go build artifacts
+/bin/
+*.db
+
+# Solid/Vite dependencies and generated bundles
+/web/node_modules/
+/web/dist/
+/web/*.tsbuildinfo
+/cmd/devbox-manager/web/
