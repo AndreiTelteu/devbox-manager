@@ -34,7 +34,9 @@ The SQLite database is `devbox-manager.db` by default. Set `DEVBOX_MANAGER_DB` t
 ./devbox-manager service start|stop|restart|enable|disable
 ```
 
-`recipe run` writes a private temporary `.mcl` file and invokes `mgmt run --tmp-prefix lang <temporary recipe.mcl>` locally. It persists status, exit code, timestamps, and combined stdout/stderr. `--max-runtime <seconds>` clamps each run and is forwarded to mgmt as `--max-runtime`. `--server-id` records an inventory server for audit, but does **not** perform remote execution; remote mgmt agents/etcd are intentionally outside this MVP.
+`recipe run` writes a private temporary `.mcl` file and invokes `mgmt run --tmp-prefix lang <temporary recipe.mcl>` locally. It persists status, exit code, timestamps, and combined stdout/stderr. `--max-runtime <seconds>` clamps each run and is forwarded to mgmt as `--max-runtime`. With mgmt 1.1.0, the runner uses `--converger-timeout` and `--converged-exit` for its convergence exit. An empty `--mgmt-seeds` (the default) starts an isolated embedded etcd; set it only when an existing mgmt etcd endpoint is available. Because mgmt's embedded etcd uses fixed localhost ports, isolated runs are queued one at a time. `--server-id` records an inventory server for audit, but does **not** perform remote execution; remote mgmt agents/etcd are intentionally outside this MVP.
+
+By default, `serve` first resolves `mgmt` from its own `PATH`, then asks fish with `fish -lc 'command -s -- mgmt'`. This makes user-local installations such as `~/.local/bin/mgmt` available when devbox-manager runs as a systemd user service. Use `-mgmt /absolute/path/to/mgmt` to override this lookup.
 
 ## REST API
 

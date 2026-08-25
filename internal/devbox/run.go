@@ -23,7 +23,10 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"sync"
 )
+
+var isolatedMgmtMu sync.Mutex
 
 type Runner struct {
 	Store            *Store
@@ -67,10 +70,15 @@ func (r Runner) Run(ctx context.Context, recipeID int64, serverID *int64, maxRun
 	// The distro service already owns Mgmt's embedded etcd on 127.0.0.1:2379.
 	// Join it rather than starting a second embedded server for every recipe.
 	if r.Seeds != "" {
-		args = append(args, "--no-server", "--seeds="+r.Seeds)
+		args = append(args, "--seeds="+r.Seeds)
+	} else {
+		// mgmt 1.1.0 uses fixed localhost etcd ports for an embedded server.
+		// Keep isolated runs serial so concurrent API requests cannot collide.
+		isolatedMgmtMu.Lock()
+		defer isolatedMgmtMu.Unlock()
 	}
 	if r.ConvergedTimeout > 0 {
-		args = append(args, "--converged-timeout", strconv.Itoa(r.ConvergedTimeout))
+		args = append(args, "--converger-timeout", strconv.Itoa(r.ConvergedTimeout), "--converged-exit")
 	}
 	if maxRuntime > 0 {
 		args = append(args, "--max-runtime", strconv.Itoa(maxRuntime))
