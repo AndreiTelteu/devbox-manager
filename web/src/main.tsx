@@ -19,11 +19,9 @@ import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show }
 import { render } from 'solid-js/web'
 import { blockIssues, emitMcl, KIND_SPECS, newBlock, PALETTE, parseMcl, summarize } from './builder'
 import type { BlockKind, BlockNode, BuilderNode } from './builder'
+import { connectEvents, store, useAppSelector } from './store'
+import type { Recipe, Run, Server } from './store'
 import './styles.css'
-
-type Server = { id: number; name: string; host: string; port: number; username: string; created_at: string; updated_at: string }
-type Recipe = { id: number; name: string; content: string; created_at: string; updated_at: string }
-type Run = { id: number; recipe_id: number; server_id?: number | null; status: 'running' | 'succeeded' | 'failed'; exit_code?: number | null; output: string; started_at: string; finished_at?: string | null }
 
 const mclStarter = `# Mgmt Config recipe\n# Define the desired state below.\n\nfile "/tmp/devbox-managed.txt" {\n\tcontent => "Managed by Devbox Manager\\n",\n\tstate => "exists",\n}\n`
 
@@ -75,13 +73,17 @@ type RecipeTab = 'view' | 'edit' | 'builder'
 
 type Modal =
   | { kind: 'server-form'; draft: Partial<Server> }
-  | { kind: 'run'; run: Run }
+  | { kind: 'run'; id: number }
   | { kind: 'confirm'; title: string; body: string; label: string; action: () => Promise<void> }
 
+const RUNS_REFRESH_MS = 10_000
+
 function App() {
-  const [servers, setServers] = createSignal<Server[]>([])
-  const [recipes, setRecipes] = createSignal<Recipe[]>([])
-  const [runs, setRuns] = createSignal<Run[]>([])
+  const servers = useAppSelector(s => s.servers)
+  const recipes = useAppSelector(s => s.recipes)
+  const runs = useAppSelector(s => s.runs)
+  const loaded = useAppSelector(s => s.loaded)
+  const live = useAppSelector(s => s.live)
   const [railTab, setRailTab] = createSignal<'recipes' | 'servers'>('recipes')
   const [selectedRecipeID, setSelectedRecipeID] = createSignal<number | null>(null)
   const [selectedServerID, setSelectedServerID] = createSignal<number | null>(null)
@@ -92,7 +94,6 @@ function App() {
   const [notice, setNotice] = createSignal('')
   const [error, setError] = createSignal('')
   const [modal, setModal] = createSignal<Modal | null>(null)
-  const [loaded, setLoaded] = createSignal(false)
 
   const recipesByID = createMemo(() => new Map(recipes().map(r => [r.id, r])))
   const serversByID = createMemo(() => new Map(servers().map(s => [s.id, s])))
@@ -144,12 +145,16 @@ function App() {
 
   const reload = async () => {
     try {
-      const [nextServers, nextRecipes, nextRuns] = await Promise.all([api<Server[]>('/servers'), api<Recipe[]>('/recipes'), api<Run[]>('/runs')])
-      setServers(nextServers); setRecipes(nextRecipes); setRuns(nextRuns); setLoaded(true)
+      await store.loadAll()
     } catch (e) { fail(e) }
   }
-  onMount(() => { reload() })
-  const pollTimer = window.setInterval(() => { if (runs().some(r => r.status === 'running')) reload() }, 4000)
+  onMount(() => {
+    reload()
+    connectEvents()
+  })
+  // Background refresh touches only the executions dock; servers and recipes
+  // update through explicit user actions and run events arrive over SSE.
+  const pollTimer = window.setInterval(() => { void store.refreshRuns() }, RUNS_REFRESH_MS)
   const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setModal(null) }
   window.addEventListener('keydown', onKey)
   onCleanup(() => { window.clearInterval(pollTimer); window.removeEventListener('keydown', onKey) })
@@ -201,14 +206,17 @@ function App() {
       const known = new Set([LOCAL_CONTEXT, ...servers().map(s => String(s.id))])
       const targets = runContexts().filter(id => known.has(id))
       const queue = targets.length ? targets : [LOCAL_CONTEXT]
-      await Promise.all(queue.map(id => {
+      message(queue.length > 1 ? `${queue.length} runs started — watch the dock below.` : 'Run started — watch the dock below.')
+      await Promise.all(queue.map(async id => {
         const body: Record<string, number> = {}
         if (id !== LOCAL_CONTEXT) body.server_id = Number(id)
         if (maxRuntime() > 0) body.max_runtime = maxRuntime()
-        return api(`/recipes/${recipeID}/run`, { method: 'POST', body: JSON.stringify(body) })
+        // The POST resolves when the run finishes; live progress arrives over
+        // the /api/events stream. Upsert guards against a missed SSE frame.
+        try {
+          store.upsertRun(await api<Run>(`/recipes/${recipeID}/run`, { method: 'POST', body: JSON.stringify(body) }))
+        } catch (e) { fail(e) }
       }))
-      await reload()
-      message(queue.length > 1 ? `${queue.length} runs started — watch the dock below.` : 'Run started — watch the dock below.')
     } catch (e) { fail(e) }
   }
   async function copyOutput(text: string) {
@@ -235,7 +243,7 @@ function App() {
           <h1>Devbox Manager</h1>
         </div>
         <div class="command-status">
-          <span class="pill"><span class="pulse" /> SQLite-backed</span>
+          <span class="pill"><span class="pulse" /> File-backed</span>
           <button class="btn ghost sm" onClick={reload} title="Reload all data"><Icon d={icons.refresh} /> Refresh</button>
         </div>
       </header>
@@ -359,12 +367,14 @@ function App() {
       <footer class="dock panel" aria-label="Recent executions">
         <div class="dock-head">
           <h2><Icon d={icons.terminal} /> Executions</h2>
-          <span class="dock-hint mono">{sortedRuns().filter(r => r.status === 'running').length > 0 ? 'polling while runs are active…' : 'click a run for full output'}</span>
+          <span classList={{ 'dock-hint': true, mono: true, live: live() }}>
+            <Show when={live()} fallback="reconnecting…">live · refreshed every 10s</Show>
+          </span>
         </div>
         <div class="dock-list">
           <For each={sortedRuns()} fallback={<p class="empty slim">{loaded() ? 'No runs yet — press Run on any recipe.' : 'Loading executions…'}</p>}>
             {run => (
-              <button class="dock-row" onClick={() => setModal({ kind: 'run', run })}>
+              <button class="dock-row" onClick={() => setModal({ kind: 'run', id: run.id })}>
                 <span class={`status s-${run.status}`}>{statusLabel[run.status]}</span>
                 <span class="dock-name">{recipesByID().get(run.recipe_id)?.name ?? `Recipe #${run.recipe_id}`}</span>
                 <span class="dock-target">{runTarget(run)}</span>
@@ -761,7 +771,7 @@ function ModalSwitch(props: {
         <ServerForm draft={(props.modal as Extract<Modal, { kind: 'server-form' }>).draft} onSave={props.saveServer} onCancel={props.onCancel} />
       </Show>
       <Show when={props.modal.kind === 'run'}>
-        <RunDetail run={(props.modal as Extract<Modal, { kind: 'run' }>).run} onClose={props.onCancel} onCopy={props.onCopied} fmtFull={props.fmtFull} fmtDuration={props.fmtDuration} runTarget={props.runTarget} />
+        <RunDetail id={(props.modal as Extract<Modal, { kind: 'run' }>).id} onClose={props.onCancel} onCopy={props.onCopied} fmtFull={props.fmtFull} fmtDuration={props.fmtDuration} runTarget={props.runTarget} />
       </Show>
       <Show when={props.modal.kind === 'confirm'}>
         <ConfirmDialog spec={props.modal as Extract<Modal, { kind: 'confirm' }>} onCancel={props.onCancel} />
@@ -818,30 +828,37 @@ function ContextMultiSelect(props: { servers: Server[]; selected: string[]; onTo
   }
   return (
     <div class="ms-list" role="group" aria-label="Execution context">
-      <Option id={LOCAL_CONTEXT} title="Local runner (MVP)" sub="mgmt run on this machine" />
+      <Option id={LOCAL_CONTEXT} title="Local runner" sub="mgmt run on this machine" />
       <For each={props.servers}>{s => <Option id={String(s.id)} title={s.name} sub={`${s.username}@${s.host}:${s.port}`} />}</For>
     </div>
   )
 }
 
-function RunDetail(props: { run: Run; onClose: () => void; onCopy: (t: string) => void; fmtFull: (iso: string) => string; fmtDuration: (r: Run) => string; runTarget: (r: Run) => string }) {
+function RunDetail(props: { id: number; onClose: () => void; onCopy: (t: string) => void; fmtFull: (iso: string) => string; fmtDuration: (r: Run) => string; runTarget: (r: Run) => string }) {
+  // The run is read from the global store so streamed output and the final
+  // status land in the open dialog without any polling or re-render churn.
+  const run = useAppSelector(s => s.runs.find(r => r.id === props.id))
   const statusLabel: Record<string, string> = { running: 'Running', succeeded: 'Succeeded', failed: 'Failed' }
   return (
-    <ModalFrame title="Execution detail" onClose={props.onClose}>
-      <dl class="meta run-meta">
-        <div><dt>Status</dt><dd><span class={`status s-${props.run.status}`}>{statusLabel[props.run.status]}</span></dd></div>
-        <div><dt>Exit code</dt><dd class="mono">{props.run.exit_code ?? (props.run.status === 'running' ? '—' : '')}</dd></div>
-        <div><dt>Started</dt><dd>{props.fmtFull(props.run.started_at)}</dd></div>
-        <div><dt>Finished</dt><dd>{props.run.finished_at ? props.fmtFull(props.run.finished_at) : '—'}</dd></div>
-        <div><dt>Duration</dt><dd class="mono">{props.fmtDuration(props.run)}</dd></div>
-        <div><dt>Target</dt><dd>{props.runTarget(props.run)}</dd></div>
-      </dl>
-      <pre class="output mono">{props.run.output || (props.run.status === 'running' ? 'mgmt is running — output lands here when it finishes.' : '(no output)')}</pre>
-      <div class="dialog-actions">
-        <Show when={props.run.output}><button class="btn ghost" onClick={() => props.onCopy(props.run.output)}><Icon d={icons.copy} /> Copy output</button></Show>
-        <button class="btn primary" onClick={props.onClose}>Close</button>
-      </div>
-    </ModalFrame>
+    <Show when={run()} keyed>
+      {r => (
+        <ModalFrame title="Execution detail" onClose={props.onClose}>
+          <dl class="meta run-meta">
+            <div><dt>Status</dt><dd><span class={`status s-${r.status}`}>{statusLabel[r.status]}</span></dd></div>
+            <div><dt>Exit code</dt><dd class="mono">{r.exit_code ?? (r.status === 'running' ? '—' : '')}</dd></div>
+            <div><dt>Started</dt><dd>{props.fmtFull(r.started_at)}</dd></div>
+            <div><dt>Finished</dt><dd>{r.finished_at ? props.fmtFull(r.finished_at) : '—'}</dd></div>
+            <div><dt>Duration</dt><dd class="mono">{props.fmtDuration(r)}</dd></div>
+            <div><dt>Target</dt><dd>{props.runTarget(r)}</dd></div>
+          </dl>
+          <pre class="output mono">{r.output || (r.status === 'running' ? 'mgmt is running — output streams here live.' : '(no output)')}</pre>
+          <div class="dialog-actions">
+            <Show when={r.output}><button class="btn ghost" onClick={() => props.onCopy(r.output)}><Icon d={icons.copy} /> Copy output</button></Show>
+            <button class="btn primary" onClick={props.onClose}>Close</button>
+          </div>
+        </ModalFrame>
+      )}
+    </Show>
   )
 }
 

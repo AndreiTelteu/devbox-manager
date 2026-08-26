@@ -2,6 +2,9 @@
 /bin/
 *.db
 
+# Private nested data repo (hosts, recipes, logs) — never tracked by parent
+/data/
+
 # Solid/Vite dependencies and generated bundles
 /web/node_modules/
 /web/dist/

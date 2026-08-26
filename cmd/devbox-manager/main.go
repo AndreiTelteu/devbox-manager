@@ -50,11 +50,11 @@ func run(ctx context.Context, args []string) error {
 	if args[0] == "service" {
 		return service(args[1:])
 	}
-	dbPath := os.Getenv("DEVBOX_MANAGER_DB")
-	if dbPath == "" {
-		dbPath = "devbox-manager.db"
+	dataDir := os.Getenv("DEVBOX_MANAGER_DATA")
+	if dataDir == "" {
+		dataDir = "data"
 	}
-	s, e := devbox.Open(ctx, dbPath)
+	s, e := devbox.Open(ctx, dataDir)
 	if e != nil {
 		return e
 	}
@@ -112,7 +112,8 @@ func serve(s *devbox.Store, args []string) error {
 	if err != nil {
 		return err
 	}
-	api := devbox.API{Store: s, Runner: devbox.Runner{Store: s, Executable: mgmtExecutable, Seeds: *mgmtSeeds, ConvergedTimeout: *convergedTimeout}}
+	broker := devbox.NewBroker()
+	api := devbox.API{Store: s, Events: broker, Runner: devbox.Runner{Store: s, Events: broker, Executable: mgmtExecutable, Seeds: *mgmtSeeds, ConvergedTimeout: *convergedTimeout}}
 	handler, err := webHandler(api.Handler())
 	if err != nil {
 		return err
@@ -171,10 +172,17 @@ func service(args []string) error {
 		if err != nil {
 			return fmt.Errorf("resolve executable symlink: %w", err)
 		}
-		dbPath := os.Getenv("DEVBOX_MANAGER_DB")
-		if dbPath == "" {
-			dbPath = filepath.Join(filepath.Dir(executable), "devbox-manager.db")
+		dataDir := os.Getenv("DEVBOX_MANAGER_DATA")
+		if dataDir == "" {
+			// Prefer <repo>/data when the binary lives in <repo>/bin/.
+			candidate := filepath.Join(filepath.Dir(executable), "..", "data")
+			if abs, err := filepath.Abs(candidate); err == nil {
+				dataDir = abs
+			} else {
+				dataDir = filepath.Join(filepath.Dir(executable), "data")
+			}
 		}
+		workDir := filepath.Dir(dataDir)
 		unit := fmt.Sprintf(`[Unit]
 Description=Devbox Manager
 After=network-online.target
@@ -182,14 +190,15 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-Environment=DEVBOX_MANAGER_DB=%s
+WorkingDirectory=%s
+Environment=DEVBOX_MANAGER_DATA=%s
 ExecStart=%s serve -addr %s -mgmt %s -mgmt-seeds %s -converged-timeout %d
 Restart=on-failure
 RestartSec=5s
 
 [Install]
 WantedBy=default.target
-`, systemdQuote(dbPath), systemdQuote(executable), systemdQuote(*addr), systemdQuote(*mgmt), systemdQuote(*mgmtSeeds), *convergedTimeout)
+`, workDir, dataDir, systemdQuote(executable), systemdQuote(*addr), systemdQuote(*mgmt), systemdQuote(*mgmtSeeds), *convergedTimeout)
 		unitDir, err := userSystemdUnitDir()
 		if err != nil {
 			return err

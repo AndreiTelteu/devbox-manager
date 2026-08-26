@@ -9,7 +9,10 @@ go build -o devbox-manager ./cmd/devbox-manager
 ./devbox-manager serve -addr :8080
 ```
 
-The SQLite database is `devbox-manager.db` by default. Set `DEVBOX_MANAGER_DB` to choose another path.
+Inventory lives under `data/` (`hosts.yml`, `recipes/*.mcl`, `logs/`). Set
+`DEVBOX_MANAGER_DATA` to choose another root. `data/` is a nested private git
+repo (ignored by the parent project); host/recipe edits auto-commit; `logs/`
+stays untracked.
 
 ## CLI
 

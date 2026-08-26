@@ -9,8 +9,9 @@ same as mgmt — every source file starts with the short GPL header comment.
 
 - `cmd/devbox-manager/main.go` — CLI entry point (`serve`, `service`, `server`,
   `recipe` subcommands); `//go:embed web` bundles the built SPA.
-- `internal/devbox/` — SQLite store (`store.go`), HTTP/JSON API (`http.go`),
-  mgmt runner (`run.go`).
+- `internal/devbox/` — file store under `data/` (`store.go`: `hosts.yml`,
+  `recipes/*.mcl`, `logs/*.json`), HTTP/JSON API (`http.go`), mgmt runner
+  (`run.go`). `data/` is a nested private git repo ignored by the parent.
 - `web/` — SolidJS SPA. `src/main.tsx` is the app, `src/builder.ts` the pure
   MCL parser/emitter model for the Builder tab (no React/Solid imports).
 - `bin/devbox-manager` — the built binary the systemd user service runs.

@@ -26,6 +26,7 @@ import (
 
 type API struct {
 	Store  *Store
+	Events *Broker
 	Runner Runner
 }
 
@@ -34,6 +35,7 @@ func (a API) Handler() http.Handler {
 	mux.HandleFunc("GET /api/health", func(w http.ResponseWriter, r *http.Request) {
 		respond(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
+	mux.HandleFunc("GET /api/events", a.sseEvents)
 	mux.HandleFunc("GET /api/servers", a.listServers)
 	mux.HandleFunc("POST /api/servers", a.createServer)
 	mux.HandleFunc("GET /api/servers/{id}", a.getServer)
@@ -225,6 +227,13 @@ func (a API) runRecipe(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	respond(w, 201, v)
+}
+func (a API) sseEvents(w http.ResponseWriter, r *http.Request) {
+	if a.Events == nil {
+		respond(w, http.StatusServiceUnavailable, map[string]string{"error": "event streaming unavailable"})
+		return
+	}
+	a.Events.ServeSSE(w, r)
 }
 func (a API) listRecentRuns(w http.ResponseWriter, r *http.Request) {
 	v, e := a.Store.ListRecentRuns(r.Context(), 50)
