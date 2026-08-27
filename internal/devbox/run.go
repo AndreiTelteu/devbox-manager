@@ -10,6 +10,7 @@ import (
 	"bytes"
 	"context"
 	_ "embed"
+	"encoding/json"
 	"errors"
 	"io"
 	"os"
@@ -159,7 +160,7 @@ func bunInvocation(path string, maxRuntime int) string {
 }
 
 func (r Runner) command(ctx context.Context, serverID *int64, server Server, content string, maxRuntime int) (*exec.Cmd, error) {
-	content = recipeHelpers + "\n" + content
+	content = recipeHelpers + "\n" + serverEnvironment(server.Secrets) + content
 	nix := r.NixShellExecutable
 	if nix == "" {
 		nix = "nix-shell"
@@ -193,4 +194,17 @@ func (r Runner) command(ctx context.Context, serverID *int64, server Server, con
 	cmd := exec.CommandContext(ctx, nix, "-p", "bun", "--run", bunInvocation(path, maxRuntime))
 	cmd.Dir = dir
 	return cmd, nil
+}
+
+// serverEnvironment makes saved server secrets available to the Bun process
+// and its child commands without exposing values in SSH command arguments.
+func serverEnvironment(secrets map[string]string) string {
+	if len(secrets) == 0 {
+		return ""
+	}
+	b, err := json.Marshal(secrets)
+	if err != nil {
+		return ""
+	}
+	return "Object.assign(process.env, " + string(b) + ")\n"
 }

@@ -39,13 +39,14 @@ type Store struct {
 }
 
 type Server struct {
-	ID        int64     `json:"id" yaml:"id"`
-	Name      string    `json:"name" yaml:"name"`
-	Host      string    `json:"host" yaml:"host"`
-	Port      int       `json:"port" yaml:"port"`
-	Username  string    `json:"username" yaml:"username"`
-	CreatedAt time.Time `json:"created_at" yaml:"created_at"`
-	UpdatedAt time.Time `json:"updated_at" yaml:"updated_at"`
+	ID        int64             `json:"id" yaml:"id"`
+	Name      string            `json:"name" yaml:"name"`
+	Host      string            `json:"host" yaml:"host"`
+	Port      int               `json:"port" yaml:"port"`
+	Username  string            `json:"username" yaml:"username"`
+	Secrets   map[string]string `json:"secrets" yaml:"secrets,omitempty"`
+	CreatedAt time.Time         `json:"created_at" yaml:"created_at"`
+	UpdatedAt time.Time         `json:"updated_at" yaml:"updated_at"`
 }
 
 type Recipe struct {
@@ -85,6 +86,7 @@ type recipeMeta struct {
 }
 
 var safeName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
+var safeEnvKey = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
 func Open(ctx context.Context, root string) (*Store, error) {
 	if root == "" {
@@ -272,6 +274,19 @@ func cleanServer(v Server) (Server, error) {
 	if v.Port < 1 || v.Port > 65535 {
 		return v, errors.New("port must be between 1 and 65535")
 	}
+	if len(v.Secrets) == 0 {
+		v.Secrets = nil
+		return v, nil
+	}
+	secrets := make(map[string]string, len(v.Secrets))
+	for key, value := range v.Secrets {
+		key = strings.TrimSpace(key)
+		if !safeEnvKey.MatchString(key) {
+			return v, fmt.Errorf("secret key %q must match [A-Za-z_][A-Za-z0-9_]*", key)
+		}
+		secrets[key] = value
+	}
+	v.Secrets = secrets
 	return v, nil
 }
 

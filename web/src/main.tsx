@@ -59,6 +59,7 @@ const loadMaxRuntime = (): number => {
 }
 
 type RecipeTab = 'view' | 'edit'
+type SecretEntry = { key: string; value: string }
 
 type Modal =
   | { kind: 'server-form'; draft: Partial<Server> }
@@ -156,6 +157,13 @@ function App() {
       if (draft.id) setSelectedServerID(draft.id)
       message(draft.id ? 'Server updated.' : 'Server added to inventory.')
     } catch (e) { fail(e) }
+  }
+  async function saveServerSecrets(server: Server, secrets: Record<string, string>) {
+    try {
+      await api(`/servers/${server.id}`, { method: 'PUT', body: JSON.stringify({ ...server, secrets }) })
+      await reload()
+      message('Server secrets saved.')
+    } catch (e) { fail(e); throw e }
   }
   async function saveRecipe(draft: { id?: number; name: string; content: string }) {
     try {
@@ -310,6 +318,7 @@ function App() {
                     <button class="btn ghost" onClick={() => setModal({ kind: 'server-form', draft: srv() })}><Icon d={icons.pencil} /> Edit</button>
                     <button class="btn ghost danger" onClick={() => removeServer(srv().id)}><Icon d={icons.trash} /> Delete</button>
                   </div>
+                  <ServerSecrets server={srv()} onSave={saveServerSecrets} />
                 </>
               )}
             </Show>
@@ -564,6 +573,59 @@ function ServerForm(props: { draft: Partial<Server>; onSave: (d: Partial<Server>
         </div>
       </form>
     </ModalFrame>
+  )
+}
+
+function ServerSecrets(props: { server: Server; onSave: (server: Server, secrets: Record<string, string>) => Promise<void> }) {
+  const fromServer = () => Object.entries(props.server.secrets ?? {}).sort(([a], [b]) => a.localeCompare(b)).map(([key, value]) => ({ key, value }))
+  const [entries, setEntries] = createSignal<SecretEntry[]>(fromServer())
+  const [newEntry, setNewEntry] = createSignal<SecretEntry>({ key: '', value: '' })
+  const [saving, setSaving] = createSignal(false)
+  createEffect(() => {
+    props.server.id
+    setEntries(fromServer())
+    setNewEntry({ key: '', value: '' })
+  })
+  const currentSecrets = () => Object.fromEntries(entries().filter(entry => entry.key.trim()).map(entry => [entry.key.trim(), entry.value]))
+  const savedSecrets = () => JSON.stringify(Object.fromEntries(fromServer().map(entry => [entry.key, entry.value])))
+  const dirty = () => JSON.stringify(currentSecrets()) !== savedSecrets()
+  const updateEntry = (index: number, patch: Partial<SecretEntry>) => setEntries(items => items.map((item, i) => i === index ? { ...item, ...patch } : item))
+  const appendIfReady = (patch: Partial<SecretEntry>) => {
+    const next = { ...newEntry(), ...patch }
+    setNewEntry(next)
+    if (next.key.trim() && next.value) {
+      setEntries(items => [...items, { key: next.key.trim(), value: next.value }])
+      setNewEntry({ key: '', value: '' })
+    }
+  }
+  const save = async () => {
+    setSaving(true)
+    try { await props.onSave(props.server, currentSecrets()) } finally { setSaving(false) }
+  }
+  return (
+    <section class="secrets" aria-label="Server secrets">
+      <div class="secrets-head">
+        <div><h3>Secrets</h3><p>Injected into remote Bun runs as environment variables.</p></div>
+        <span class="tag">{entries().length} saved</span>
+      </div>
+      <div class="secret-table" role="table" aria-label="Server environment variables">
+        <div class="secret-row secret-labels" role="row"><span role="columnheader">Env key</span><span role="columnheader">Env value</span><span /></div>
+        <For each={entries()}>{(entry, index) => (
+          <div class="secret-row" role="row">
+            <input class="mono" aria-label="Environment key" value={entry.key} onInput={e => updateEntry(index(), { key: e.currentTarget.value })} />
+            <input class="mono" aria-label={`Value for ${entry.key || 'environment key'}`} type="password" value={entry.value} onInput={e => updateEntry(index(), { value: e.currentTarget.value })} />
+            <button class="chip danger-chip" title={`Remove ${entry.key}`} onClick={() => setEntries(items => items.filter((_, i) => i !== index()))}><Icon d={icons.trash} /></button>
+          </div>
+        )}</For>
+        <div class="secret-row secret-new" role="row">
+          <input class="mono" aria-label="New environment key" placeholder="Env key" value={newEntry().key} onInput={e => appendIfReady({ key: e.currentTarget.value })} />
+          <input class="mono" aria-label="New environment value" placeholder="Env value" type="password" value={newEntry().value} onInput={e => appendIfReady({ value: e.currentTarget.value })} />
+          <span />
+        </div>
+      </div>
+      <p class="scope-note">In recipes, use <code class="mono">process.env.MY_SECRET</code> or <code class="mono">{'$.env({ MY_SECRET: process.env.MY_SECRET })'}</code> before a command.</p>
+      <button class="btn primary" disabled={!dirty() || saving()} onClick={save}>{saving() ? 'Saving...' : 'Save secrets'}</button>
+    </section>
   )
 }
 

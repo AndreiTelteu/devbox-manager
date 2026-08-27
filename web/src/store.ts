@@ -5,7 +5,7 @@
 
 import { createSignal, onCleanup } from 'solid-js'
 
-export type Server = { id: number; name: string; host: string; port: number; username: string; created_at: string; updated_at: string }
+export type Server = { id: number; name: string; host: string; port: number; username: string; secrets?: Record<string, string>; created_at: string; updated_at: string }
 export type Recipe = { id: number; name: string; content: string; created_at: string; updated_at: string }
 export type Run = { id: number; recipe_id: number; server_id?: number | null; status: 'running' | 'succeeded' | 'failed'; exit_code?: number | null; output: string; started_at: string; finished_at?: string | null }
 

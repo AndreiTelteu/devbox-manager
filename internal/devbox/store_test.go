@@ -83,7 +83,7 @@ func TestRunnerPersistsFailedExecution(t *testing.T) {
 
 func TestRunnerBuildsRemoteSSHCommand(t *testing.T) {
 	s := newTestStore(t)
-	server := Server{Host: "mini3", Port: 2222, Username: "andrei"}
+	server := Server{Host: "mini3", Port: 2222, Username: "andrei", Secrets: map[string]string{"DEPLOY_TOKEN": "top secret"}}
 	id := int64(1)
 	cmd, e := (Runner{Store: s, SSHExecutable: "ssh-test"}).command(context.Background(), &id, server, "import { $ } from \"bun\"\nawait $`echo hi`\n", 60)
 	if e != nil {
@@ -109,6 +109,28 @@ func TestRunnerBuildsRemoteSSHCommand(t *testing.T) {
 		if !strings.Contains(string(body), want) {
 			t.Fatalf("injected recipe does not contain %q", want)
 		}
+	}
+	if !strings.Contains(string(body), `Object.assign(process.env, {"DEPLOY_TOKEN":"top secret"})`) {
+		t.Fatalf("server secret was not injected into recipe: %q", body)
+	}
+	if strings.Contains(joined, "top secret") {
+		t.Fatalf("remote command exposes secret: %q", joined)
+	}
+}
+
+func TestServerSecretsPersistAndValidate(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+	server, err := s.CreateServer(ctx, Server{Name: "secrets", Host: "192.0.2.11", Port: 22, Username: "ops", Secrets: map[string]string{"API_TOKEN": "abc"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.GetServer(ctx, server.ID)
+	if err != nil || got.Secrets["API_TOKEN"] != "abc" {
+		t.Fatalf("server=%+v err=%v", got, err)
+	}
+	if _, err := s.CreateServer(ctx, Server{Name: "invalid", Host: "192.0.2.12", Port: 22, Username: "ops", Secrets: map[string]string{"BAD-KEY": "abc"}}); err == nil {
+		t.Fatal("invalid secret key was accepted")
 	}
 }
 
