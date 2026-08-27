@@ -7,6 +7,7 @@ package devbox
 
 import (
 	"context"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -99,6 +100,15 @@ func TestRunnerBuildsRemoteSSHCommand(t *testing.T) {
 	}
 	if strings.Contains(joined, "mgmt") {
 		t.Fatalf("remote command unexpectedly mentions mgmt: %q", joined)
+	}
+	body, e := io.ReadAll(cmd.Stdin)
+	if e != nil {
+		t.Fatal(e)
+	}
+	for _, want := range []string{"devboxEnsureNixPort", "import { $ } from \"bun\"", "await $`echo hi`"} {
+		if !strings.Contains(string(body), want) {
+			t.Fatalf("injected recipe does not contain %q", want)
+		}
 	}
 }
 

@@ -149,7 +149,10 @@ h2 { font-size: 21px; margin: 0; letter-spacing: -.02em; font-weight: 800 }
 .tag {
   border: 1px solid rgba(69, 209, 155, .4); color: var(--mint); border-radius: 100px;
   padding: 3px 10px; font: 11px 'DM Mono', monospace; letter-spacing: .06em; text-transform: uppercase; white-space: nowrap;
+  text-decoration: none;
 }
+.tag:hover { background: rgba(69, 209, 155, .1); border-color: var(--mint) }
+.tag:focus-visible { outline: 2px solid var(--mint); outline-offset: 3px }
 .conn-string {
   margin: 14px 0 0; padding: 12px 15px; border: 1px solid var(--line-soft); border-radius: 9px;
   background: var(--bg-inset); font-size: 15px; color: #d9e2ee; overflow-x: auto;

@@ -407,7 +407,7 @@ function RecipeDetail(props: {
     <>
       <div class="detail-head">
         <h2>{props.recipe?.name ?? 'New recipe'}</h2>
-        <span class="tag">Bun shell</span>
+        <a class="tag" href="https://bun.com/docs/runtime/shell" target="_blank" rel="noreferrer">Bun shell</a>
       </div>
       <nav class="segmented detail-tabs" role="tablist" aria-label="Recipe editing mode">
         <button role="tab" aria-selected={props.tab === 'view'} classList={{ active: props.tab === 'view' }} onClick={() => props.onTab('view')}><Icon d={icons.eye} size={13} /> View</button>

@@ -9,6 +9,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	_ "embed"
 	"errors"
 	"io"
 	"os"
@@ -141,6 +142,12 @@ func (r Runner) execute(cmd *exec.Cmd, runID int64) ([]byte, error) {
 
 const outputPushInterval = 250 * time.Millisecond
 
+// recipeHelpers is prepended to every recipe, including scripts streamed over
+// SSH, so common Bun helpers do not need to be duplicated in recipe files.
+//
+//go:embed recipe_helpers.ts
+var recipeHelpers string
+
 // bunInvocation is the shell snippet passed to `nix-shell --run`: bun (wrapped
 // in coreutils timeout when maxRuntime > 0) executing the recipe file.
 func bunInvocation(path string, maxRuntime int) string {
@@ -152,6 +159,7 @@ func bunInvocation(path string, maxRuntime int) string {
 }
 
 func (r Runner) command(ctx context.Context, serverID *int64, server Server, content string, maxRuntime int) (*exec.Cmd, error) {
+	content = recipeHelpers + "\n" + content
 	nix := r.NixShellExecutable
 	if nix == "" {
 		nix = "nix-shell"
