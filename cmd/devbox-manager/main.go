@@ -1,18 +1,7 @@
-// devbox-manager: mgmt · MCL recipe manager
+// devbox-manager: Bun shell recipe manager
 // Copyright (C) 2026  Andrei
 //
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-//
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU General Public License for more details.
-//
-// You should have received a copy of the GNU General Public License
-// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+// SPDX-License-Identifier: MIT
 
 package main
 
@@ -31,7 +20,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
-	"strconv"
 	"strings"
 
 	"github.com/andrei/devbox-manager/internal/devbox"
@@ -102,47 +90,17 @@ func webHandler(api http.Handler) (http.Handler, error) {
 func serve(s *devbox.Store, args []string) error {
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
 	addr := fs.String("addr", ":8080", "listen address")
-	mgmt := fs.String("mgmt", "mgmt", "path to mgmt executable; the default is resolved from fish")
-	mgmtSeeds := fs.String("mgmt-seeds", "", "existing Mgmt etcd endpoint; empty starts an isolated embedded etcd")
-	convergedTimeout := fs.Int("converged-timeout", 2, "seconds Mgmt must be converged before this one-shot run exits (0 disables)")
 	if e := fs.Parse(args); e != nil {
 		return e
 	}
-	mgmtExecutable, err := resolveMgmtExecutable(*mgmt)
-	if err != nil {
-		return err
-	}
 	broker := devbox.NewBroker()
-	api := devbox.API{Store: s, Events: broker, Runner: devbox.Runner{Store: s, Events: broker, Executable: mgmtExecutable, Seeds: *mgmtSeeds, ConvergedTimeout: *convergedTimeout}}
+	api := devbox.API{Store: s, Events: broker, Runner: devbox.Runner{Store: s, Events: broker}}
 	handler, err := webHandler(api.Handler())
 	if err != nil {
 		return err
 	}
-	log.Printf("serving embedded web app and API on %s with mgmt at %s", *addr, mgmtExecutable)
+	log.Printf("serving embedded web app and API on %s; recipes run with bun in nix-shell", *addr)
 	return http.ListenAndServe(*addr, handler)
-}
-
-// resolveMgmtExecutable makes a user-installed mgmt available to a systemd
-// user service, whose PATH does not include paths configured by fish.
-func resolveMgmtExecutable(configured string) (string, error) {
-	if configured != "mgmt" {
-		return configured, nil
-	}
-	if path, err := exec.LookPath(configured); err == nil {
-		return path, nil
-	}
-	output, err := exec.Command("fish", "-lc", "command -s -- mgmt").Output()
-	if err != nil {
-		return "", fmt.Errorf("resolve mgmt from PATH or fish: %w", err)
-	}
-	path := strings.TrimSpace(string(output))
-	if path == "" {
-		return "", errors.New("mgmt is not available in PATH or fish")
-	}
-	if _, err := exec.LookPath(path); err != nil {
-		return "", fmt.Errorf("resolve mgmt path from fish: %w", err)
-	}
-	return path, nil
 }
 
 const serviceName = "devbox-manager.service"
@@ -155,9 +113,6 @@ func service(args []string) error {
 	case "install":
 		fs := flag.NewFlagSet("service install", flag.ContinueOnError)
 		addr := fs.String("addr", ":8080", "listen address")
-		mgmt := fs.String("mgmt", "mgmt", "path to mgmt executable; the default is resolved from fish")
-		mgmtSeeds := fs.String("mgmt-seeds", "", "existing Mgmt etcd endpoint; empty starts an isolated embedded etcd")
-		convergedTimeout := fs.Int("converged-timeout", 2, "seconds Mgmt must be converged before a recipe run exits")
 		if err := fs.Parse(args[1:]); err != nil {
 			return err
 		}
@@ -192,13 +147,13 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory=%s
 Environment=DEVBOX_MANAGER_DATA=%s
-ExecStart=%s serve -addr %s -mgmt %s -mgmt-seeds %s -converged-timeout %d
+ExecStart=%s serve -addr %s
 Restart=on-failure
 RestartSec=5s
 
 [Install]
 WantedBy=default.target
-`, workDir, dataDir, systemdQuote(executable), systemdQuote(*addr), systemdQuote(*mgmt), systemdQuote(*mgmtSeeds), *convergedTimeout)
+`, workDir, dataDir, systemdQuote(executable), systemdQuote(*addr))
 		unitDir, err := userSystemdUnitDir()
 		if err != nil {
 			return err
@@ -372,8 +327,8 @@ func recipe(ctx context.Context, s *devbox.Store, args []string) error {
 	case "create", "update":
 		fs := flag.NewFlagSet("recipe "+args[0], flag.ContinueOnError)
 		name := fs.String("name", "", "recipe name")
-		content := fs.String("content", "", "MCL content")
-		file := fs.String("file", "", "read MCL content from file")
+		content := fs.String("content", "", "Bun shell script content")
+		file := fs.String("file", "", "read recipe content from file")
 		id := fs.Int64("id", 0, "recipe id (update)")
 		if e := fs.Parse(args[1:]); e != nil {
 			return e
@@ -412,11 +367,8 @@ func recipe(ctx context.Context, s *devbox.Store, args []string) error {
 	case "run":
 		fs := flag.NewFlagSet("recipe run", flag.ContinueOnError)
 		id := fs.Int64("id", 0, "recipe id")
-		serverID := fs.Int64("server-id", 0, "optional audited server id")
-		mgmt := fs.String("mgmt", "mgmt", "path to mgmt executable; the default is resolved from fish")
-		mgmtSeeds := fs.String("mgmt-seeds", "", "existing Mgmt etcd endpoint; empty starts an isolated embedded etcd")
-		convergedTimeout := fs.Int("converged-timeout", 2, "seconds Mgmt must be converged before this one-shot run exits (0 disables)")
-		maxRuntime := fs.Int("max-runtime", 0, "seconds before mgmt exits this run (0 disables)")
+		serverID := fs.Int64("server-id", 0, "optional server id to execute on over SSH")
+		maxRuntime := fs.Int("max-runtime", 0, "seconds before this run is killed (0 disables)")
 		if e := fs.Parse(args[1:]); e != nil {
 			return e
 		}
@@ -427,11 +379,7 @@ func recipe(ctx context.Context, s *devbox.Store, args []string) error {
 		if *serverID > 0 {
 			sp = serverID
 		}
-		mgmtExecutable, e := resolveMgmtExecutable(*mgmt)
-		if e != nil {
-			return e
-		}
-		v, e := (devbox.Runner{Store: s, Executable: mgmtExecutable, Seeds: *mgmtSeeds, ConvergedTimeout: *convergedTimeout}).Run(ctx, *id, sp, *maxRuntime)
+		v, e := (devbox.Runner{Store: s}).Run(ctx, *id, sp, *maxRuntime)
 		if e != nil {
 			return e
 		}
@@ -447,6 +395,3 @@ func print(v any) error {
 	fmt.Println(string(b))
 	return nil
 }
-
-var _ = strconv.IntSize
-var _ = strings.Builder{}

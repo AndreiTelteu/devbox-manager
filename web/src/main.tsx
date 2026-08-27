@@ -1,29 +1,20 @@
-/* devbox-manager: mgmt · MCL recipe manager
+/* devbox-manager: Bun shell recipe manager
  * Copyright (C) 2026  Andrei
  *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ * SPDX-License-Identifier: MIT
  */
 
 import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show } from 'solid-js'
 import { render } from 'solid-js/web'
-import { blockIssues, emitMcl, KIND_SPECS, newBlock, PALETTE, parseMcl, summarize } from './builder'
-import type { BlockKind, BlockNode, BuilderNode } from './builder'
 import { connectEvents, store, useAppSelector } from './store'
 import type { Recipe, Run, Server } from './store'
 import './styles.css'
 
-const mclStarter = `# Mgmt Config recipe\n# Define the desired state below.\n\nfile "/tmp/devbox-managed.txt" {\n\tcontent => "Managed by Devbox Manager\\n",\n\tstate => "exists",\n}\n`
+const bunStarter = `import { $ } from "bun"
+
+// Bun shell recipe — see https://bun.com/docs/runtime/shell
+await $\`echo "Managed by Devbox Manager"\`
+`
 
 async function api<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`/api${path}`, { headers: { 'Content-Type': 'application/json', ...(init?.headers ?? {}) }, ...init })
@@ -49,8 +40,6 @@ const icons = {
   box: 'M21 8l-9-5-9 5v8l9 5 9-5zM3 8l9 5 9-5M12 13v8',
   check: 'M5 12.5l4.5 4.5L19 7.5',
   eye: 'M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7zm10 3a3 3 0 1 0 0-6 3 3 0 0 0 0 6z',
-  blocks: 'M14 4h6v6h-6zM4 4h6v6H4zM4 14h6v6H4zM14 14h6v6h-6z',
-  warn: 'M12 9v4m0 4h.01M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z',
 }
 
 const LOCAL_CONTEXT = 'local'
@@ -69,7 +58,7 @@ const loadMaxRuntime = (): number => {
   return Number.isFinite(v) && v > 0 ? Math.min(86400, Math.floor(v)) : 0
 }
 
-type RecipeTab = 'view' | 'edit' | 'builder'
+type RecipeTab = 'view' | 'edit'
 
 type Modal =
   | { kind: 'server-form'; draft: Partial<Server> }
@@ -281,7 +270,7 @@ function App() {
                 )}
               </For>
             }>
-              <For each={recipes()} fallback={<p class="empty">No recipes yet.<button class="btn ghost" onClick={startNewRecipe}>Write your first MCL recipe</button></p>}>
+              <For each={recipes()} fallback={<p class="empty">No recipes yet.<button class="btn ghost" onClick={startNewRecipe}>Write your first Bun shell recipe</button></p>}>
                 {item => (
                   <article classList={{ row: true, selected: !newRecipeDraft() && selectedRecipeID() === item.id }} onClick={() => selectRecipe(item.id)}>
                     <div class="row-main">
@@ -316,7 +305,7 @@ function App() {
                     <div><dt>Added</dt><dd>{fmtFull(srv().created_at)}</dd></div>
                     <div><dt>Updated</dt><dd>{fmtFull(srv().updated_at)}</dd></div>
                   </dl>
-                  <p class="scope-note">Recorded for audit context on recipe runs — this MVP executes locally only.</p>
+                  <p class="scope-note">Checked in a recipe's execution context, the recipe is streamed over SSH and run in a <code class="mono">nix-shell -p bun</code> on this server.</p>
                   <div class="detail-actions">
                     <button class="btn ghost" onClick={() => setModal({ kind: 'server-form', draft: srv() })}><Icon d={icons.pencil} /> Edit</button>
                     <button class="btn ghost danger" onClick={() => removeServer(srv().id)}><Icon d={icons.trash} /> Delete</button>
@@ -398,7 +387,7 @@ function App() {
   )
 }
 
-// ---------- recipe detail: View / Edit / Builder tabs ----------
+// ---------- recipe detail: View / Edit ----------
 
 function RecipeDetail(props: {
   recipe: Recipe | null
@@ -418,12 +407,11 @@ function RecipeDetail(props: {
     <>
       <div class="detail-head">
         <h2>{props.recipe?.name ?? 'New recipe'}</h2>
-        <span class="tag">MCL</span>
+        <span class="tag">Bun shell</span>
       </div>
       <nav class="segmented detail-tabs" role="tablist" aria-label="Recipe editing mode">
         <button role="tab" aria-selected={props.tab === 'view'} classList={{ active: props.tab === 'view' }} onClick={() => props.onTab('view')}><Icon d={icons.eye} size={13} /> View</button>
         <button role="tab" aria-selected={props.tab === 'edit'} classList={{ active: props.tab === 'edit' }} onClick={() => props.onTab('edit')}><Icon d={icons.pencil} size={13} /> Edit</button>
-        <button role="tab" aria-selected={props.tab === 'builder'} classList={{ active: props.tab === 'builder' }} onClick={() => props.onTab('builder')}><Icon d={icons.blocks} size={13} /> Builder</button>
       </nav>
       <Show when={props.tab === 'view' && props.recipe}>
         <RecipeView
@@ -439,9 +427,6 @@ function RecipeDetail(props: {
       </Show>
       <Show when={props.tab === 'edit'}>
         <RecipeEditor recipe={props.recipe} onSave={props.onSave} onCancel={props.onCancelEdit} />
-      </Show>
-      <Show when={props.tab === 'builder'}>
-        <RecipeBuilder recipe={props.recipe} onSave={props.onSave} onCancel={props.onCancelEdit} />
       </Show>
     </>
   )
@@ -478,7 +463,7 @@ function RecipeView(props: {
           }}
         />
       </label>
-      <p class="scope-note">Runs execute locally via <code class="mono">mgmt run</code> — one run per checked context; checked servers are saved as audit context. Use <code class="mono">0</code> for no time limit; anything above is passed to mgmt as <code class="mono">--max-runtime</code>.</p>
+      <p class="scope-note">Runs execute in a <code class="mono">nix-shell -p bun</code> — locally, or over SSH on each checked server; one run per checked context. Use <code class="mono">0</code> for no time limit.</p>
       <div class="detail-actions">
         <Show when={props.onRun}>
           <button class="btn primary" onClick={() => props.onRun!()}><Icon d={icons.play} /> Run now</button>
@@ -497,7 +482,7 @@ function RecipeEditor(props: {
   onCancel: () => void
 }) {
   const [name, setName] = createSignal(props.recipe?.name ?? '')
-  const [content, setContent] = createSignal(props.recipe?.content ?? mclStarter)
+  const [content, setContent] = createSignal(props.recipe?.content ?? bunStarter)
   const [busy, setBusy] = createSignal(false)
   const submit = () => {
     if (busy()) return
@@ -509,7 +494,7 @@ function RecipeEditor(props: {
       <label>Name
         <input required value={name()} onInput={e => setName(e.currentTarget.value)} placeholder="Install nginx" />
       </label>
-      <label>Recipe content — MCL
+      <label>Recipe content — Bun shell script
         <textarea class="mono" required spellcheck={false} rows={16} value={content()} onInput={e => setContent(e.currentTarget.value)} />
       </label>
       <div class="detail-actions">
@@ -520,239 +505,6 @@ function RecipeEditor(props: {
   )
 }
 
-const DND_KIND = 'application/x-devbox-kind'
-const DND_UID = 'application/x-devbox-uid'
-
-function RecipeBuilder(props: {
-  recipe: Recipe | null
-  onSave: (d: { id?: number; name: string; content: string }) => Promise<void>
-  onCancel: () => void
-}) {
-  const [name, setName] = createSignal(props.recipe?.name ?? '')
-  const [nodes, setNodes] = createSignal<BuilderNode[]>(parseMcl(props.recipe?.content ?? mclStarter))
-  const [selectedUid, setSelectedUid] = createSignal<string | null>(null)
-  const [dropIndex, setDropIndex] = createSignal<number | null>(null)
-  const [busy, setBusy] = createSignal(false)
-
-  const selectedNode = createMemo(() => nodes().find(n => n.uid === selectedUid()) ?? null)
-  const emitted = createMemo(() => emitMcl(nodes()))
-
-  const updateNode = (uid: string, patch: Partial<BlockNode>) =>
-    setNodes(ns => ns.map(n => (n.uid === uid && n.type === 'block' ? { ...n, ...patch } : n)))
-  const patchField = (uid: string, key: string, value: string) =>
-    setNodes(ns => ns.map(n => (n.uid === uid && n.type === 'block' ? { ...n, fields: { ...n.fields, [key]: value } } : n)))
-  const removeNode = (uid: string) => {
-    if (selectedUid() === uid) setSelectedUid(null)
-    setNodes(ns => ns.filter(n => n.uid !== uid))
-  }
-  const insertAt = (idx: number, node: BuilderNode) => {
-    setNodes(ns => { const next = [...ns]; next.splice(Math.max(0, Math.min(idx, next.length)), 0, node); return next })
-    if (node.type === 'block') setSelectedUid(node.uid)
-  }
-  const moveBlock = (uid: string, idx: number) => {
-    const cur = nodes()
-    const from = cur.findIndex(n => n.uid === uid)
-    if (from === -1) return
-    const next = [...cur]
-    const [node] = next.splice(from, 1)
-    next.splice(Math.max(0, from < idx ? idx - 1 : idx), 0, node)
-    setNodes(next)
-    setSelectedUid(uid)
-  }
-
-  const dndTypes = (e: DragEvent) => Array.from(e.dataTransfer?.types ?? [])
-  const onCanvasDragOver = (e: DragEvent) => {
-    const types = dndTypes(e)
-    if (!types.includes(DND_KIND) && !types.includes(DND_UID)) return
-    e.preventDefault()
-    if (e.dataTransfer) e.dataTransfer.dropEffect = types.includes(DND_KIND) ? 'copy' : 'move'
-    const canvas = e.currentTarget as HTMLElement
-    const cards = Array.from(canvas.querySelectorAll<HTMLElement>('.bblk'))
-    let idx = cards.length
-    for (let i = 0; i < cards.length; i++) {
-      const r = cards[i].getBoundingClientRect()
-      if (e.clientY < r.top + r.height / 2) { idx = i; break }
-    }
-    setDropIndex(idx)
-  }
-  const onCanvasDrop = (e: DragEvent) => {
-    e.preventDefault()
-    const kind = e.dataTransfer?.getData(DND_KIND) ?? ''
-    const uid = e.dataTransfer?.getData(DND_UID) ?? ''
-    const idx = dropIndex() ?? nodes().length
-    if (kind && kind in KIND_SPECS) insertAt(idx, newBlock(kind as BlockKind))
-    else if (uid) moveBlock(uid, idx)
-    setDropIndex(null)
-  }
-  const onCanvasDragLeave = (e: DragEvent) => {
-    if (!(e.currentTarget as HTMLElement).contains(e.relatedTarget as Node | null)) setDropIndex(null)
-  }
-
-  const submit = () => {
-    if (busy()) return
-    setBusy(true)
-    props.onSave({ id: props.recipe?.id, name: name().trim(), content: emitted() }).finally(() => setBusy(false))
-  }
-
-  return (
-    <div class="builder-root">
-      <label class="recipe-name">Name
-        <input required value={name()} onInput={e => setName(e.currentTarget.value)} placeholder="Install nginx" />
-      </label>
-      <div classList={{ builder: true, 'no-side': !selectedNode() }}>
-        <div
-          classList={{ 'builder-canvas': true, 'drop-hint': dropIndex() !== null }}
-          onDragOver={onCanvasDragOver}
-          onDrop={onCanvasDrop}
-          onDragLeave={onCanvasDragLeave}
-        >
-          <Show when={nodes().length === 0}>
-            <p class="canvas-empty">Drag a block from the palette, or click one to append it here.</p>
-          </Show>
-          <For each={nodes()}>
-            {(node, i) => (
-              <>
-                <div classList={{ 'drop-line': true, show: dropIndex() === i() }} />
-                <BuilderCard node={node} selected={selectedUid() === node.uid} onSelect={() => setSelectedUid(node.uid)} onRemove={() => removeNode(node.uid)} />
-              </>
-            )}
-          </For>
-          <div classList={{ 'drop-line': true, show: dropIndex() === nodes().length && nodes().length > 0 }} />
-        </div>
-        <Show when={selectedNode()}>
-          {node => <BuilderSidebar node={node()} updateNode={updateNode} patchField={patchField} onClose={() => setSelectedUid(null)} />}
-        </Show>
-        <aside class="palette" aria-label="Block palette">
-          <span class="palette-title">Blocks</span>
-          <For each={PALETTE}>
-            {kind => {
-              const spec = KIND_SPECS[kind]
-              return (
-                <button
-                  type="button"
-                  class="bpal"
-                  style={{ '--kc': spec.color }}
-                  title={`${spec.label} — ${spec.hint}\nClick to append, drag to place anywhere.`}
-                  draggable={true}
-                  onDragStart={e => { e.dataTransfer?.setData(DND_KIND, kind); if (e.dataTransfer) e.dataTransfer.effectAllowed = 'copy' }}
-                  onClick={() => insertAt(nodes().length, newBlock(kind))}
-                >
-                  <span class="bblk-ic"><Icon d={spec.icon} size={13} /></span>
-                  {spec.label}
-                </button>
-              )
-            }}
-          </For>
-        </aside>
-      </div>
-      <span class="run-target">Generated MCL</span>
-      <pre class="recipe-source mono builder-src" tabIndex={0}>{emitted() || '(empty recipe)'}</pre>
-      <div class="detail-actions">
-        <button class="btn primary" disabled={busy() || !name().trim()} onClick={submit}>{busy() ? 'Saving…' : props.recipe ? 'Save changes' : 'Save recipe'}</button>
-        <button class="btn ghost" onClick={props.onCancel}>Cancel</button>
-      </div>
-    </div>
-  )
-}
-
-function BuilderCard(props: { node: BuilderNode; selected: boolean; onSelect: () => void; onRemove: () => void }) {
-  const raw = () => props.node.type === 'raw'
-  const spec = () => (props.node.type === 'block' ? KIND_SPECS[props.node.kind] : null)
-  const issues = () => blockIssues(props.node)
-  return (
-    <div
-      classList={{ bblk: true, raw: raw(), sel: props.selected }}
-      style={{ '--kc': raw() ? 'var(--text-dim)' : spec()!.color }}
-      draggable={true}
-      role="button"
-      tabIndex={0}
-      onClick={props.onSelect}
-      onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); props.onSelect() } }}
-      onDragStart={e => { e.dataTransfer?.setData(DND_UID, props.node.uid); if (e.dataTransfer) e.dataTransfer.effectAllowed = 'move' }}
-    >
-      <span class="bblk-ic"><Icon d={raw() ? icons.terminal : spec()!.icon} size={13} /></span>
-      <span class="bblk-text">
-        <strong class="bblk-title">{raw() ? 'Raw MCL' : (props.node as BlockNode).title.trim() || spec()!.titlePlaceholder}</strong>
-        <small class="bblk-sub">{summarize(props.node)}</small>
-      </span>
-      <Show when={issues().length > 0}>
-        <span class="bblk-issue" title={issues().join('\n')}><Icon d={icons.warn} size={11} /> {issues().length}</span>
-      </Show>
-      <button class="chip bblk-del" title="Remove block" onClick={e => { e.stopPropagation(); props.onRemove() }}><Icon d={icons.x} /></button>
-    </div>
-  )
-}
-
-function BuilderSidebar(props: {
-  node: BuilderNode
-  updateNode: (uid: string, patch: Partial<BlockNode>) => void
-  patchField: (uid: string, key: string, value: string) => void
-  onClose: () => void
-}) {
-  return (
-    <aside class="bside" aria-label="Block fields">
-      {props.node.type === 'block' ? (
-        <BlockFields node={props.node} updateNode={props.updateNode} patchField={props.patchField} onClose={props.onClose} />
-      ) : (
-        <RawFields node={props.node} onClose={props.onClose} />
-      )}
-    </aside>
-  )
-}
-
-function BlockFields(props: {
-  node: BlockNode
-  updateNode: (uid: string, patch: Partial<BlockNode>) => void
-  patchField: (uid: string, key: string, value: string) => void
-  onClose: () => void
-}) {
-  const spec = () => KIND_SPECS[props.node.kind]
-  return (
-    <>
-      <div class="bside-head">
-        <span class="bblk-ic" style={{ '--kc': spec().color }}><Icon d={spec().icon} size={13} /></span>
-        <strong>{spec().label}</strong>
-        <button class="chip" title="Close fields" onClick={props.onClose}><Icon d={icons.x} /></button>
-      </div>
-      <label>{spec().titleLabel}
-        <input value={props.node.title} placeholder={spec().titlePlaceholder} onInput={e => props.updateNode(props.node.uid, { title: e.currentTarget.value })} />
-      </label>
-      <For each={spec().fields}>
-        {f => (
-          <label>{f.label}
-            {f.type === 'textarea'
-              ? <textarea class="mono" rows={f.rows ?? 4} spellcheck={false} value={props.node.fields[f.key] ?? ''} placeholder={f.placeholder} onInput={e => props.patchField(props.node.uid, f.key, e.currentTarget.value)} />
-              : f.type === 'select'
-                ? <select value={props.node.fields[f.key] ?? f.default ?? ''} onChange={e => props.patchField(props.node.uid, f.key, e.currentTarget.value)}>
-                    <For each={f.options ?? []}>{o => <option value={o}>{o}</option>}</For>
-                  </select>
-                : <input
-                    type={f.type === 'int' ? 'number' : 'text'}
-                    step={f.type === 'int' ? '1' : undefined}
-                    value={props.node.fields[f.key] ?? ''}
-                    placeholder={f.placeholder}
-                    onInput={e => props.patchField(props.node.uid, f.key, e.currentTarget.value)}
-                  />}
-          </label>
-        )}
-      </For>
-    </>
-  )
-}
-
-function RawFields(props: { node: Extract<BuilderNode, { type: 'raw' }>; onClose: () => void }) {
-  return (
-    <>
-      <div class="bside-head">
-        <span class="bblk-ic"><Icon d={icons.terminal} size={13} /></span>
-        <strong>Raw MCL</strong>
-        <button class="chip" title="Close fields" onClick={props.onClose}><Icon d={icons.x} /></button>
-      </div>
-      <p class="raw-note">This part isn't a standard mgmt resource, so Builder keeps it verbatim. To change it, use the Edit tab.</p>
-      <pre class="bside-raw mono">{props.node.source}</pre>
-    </>
-  )
-}
 
 // ---------- modals ----------
 
@@ -828,7 +580,7 @@ function ContextMultiSelect(props: { servers: Server[]; selected: string[]; onTo
   }
   return (
     <div class="ms-list" role="group" aria-label="Execution context">
-      <Option id={LOCAL_CONTEXT} title="Local runner" sub="mgmt run on this machine" />
+      <Option id={LOCAL_CONTEXT} title="Local runner" sub="nix-shell -p bun on this machine" />
       <For each={props.servers}>{s => <Option id={String(s.id)} title={s.name} sub={`${s.username}@${s.host}:${s.port}`} />}</For>
     </div>
   )
@@ -851,7 +603,7 @@ function RunDetail(props: { id: number; onClose: () => void; onCopy: (t: string)
             <div><dt>Duration</dt><dd class="mono">{props.fmtDuration(r)}</dd></div>
             <div><dt>Target</dt><dd>{props.runTarget(r)}</dd></div>
           </dl>
-          <pre class="output mono">{r.output || (r.status === 'running' ? 'mgmt is running — output streams here live.' : '(no output)')}</pre>
+          <pre class="output mono">{r.output || (r.status === 'running' ? 'bun is running — output streams here live.' : '(no output)')}</pre>
           <div class="dialog-actions">
             <Show when={r.output}><button class="btn ghost" onClick={() => props.onCopy(r.output)}><Icon d={icons.copy} /> Copy output</button></Show>
             <button class="btn primary" onClick={props.onClose}>Close</button>
@@ -877,7 +629,7 @@ function ConfirmDialog(props: { spec: Extract<Modal, { kind: 'confirm' }>; onCan
 
 function DetailHint(props: { kind: 'recipe' | 'server'; loaded: boolean; onNew: () => void }) {
   const copy = props.kind === 'recipe'
-    ? { title: 'Nothing selected', body: 'Pick a recipe on the left to inspect its MCL source and run it.' }
+    ? { title: 'Nothing selected', body: 'Pick a recipe on the left to inspect its Bun shell source and run it.' }
     : { title: 'Nothing selected', body: 'Pick a server to see its connection details and usage as run context.' }
   return (
     <div class="hint">

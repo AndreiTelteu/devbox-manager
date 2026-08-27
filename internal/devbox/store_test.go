@@ -1,18 +1,7 @@
-// devbox-manager: mgmt · MCL recipe manager
+// devbox-manager: Bun shell recipe manager
 // Copyright (C) 2026  Andrei
 //
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-//
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU General Public License for more details.
-//
-// You should have received a copy of the GNU General Public License
-// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+// SPDX-License-Identifier: MIT
 
 package devbox
 
@@ -48,11 +37,11 @@ func TestServerAndRecipeCRUD(t *testing.T) {
 	if _, e = s.UpdateServer(ctx, server.ID, server); e != nil {
 		t.Fatal(e)
 	}
-	recipe, e := s.CreateRecipe(ctx, Recipe{Name: "hello", Content: "# MCL"})
+	recipe, e := s.CreateRecipe(ctx, Recipe{Name: "hello", Content: "import { $ } from \"bun\"\nawait $`echo hello`\n"})
 	if e != nil {
 		t.Fatal(e)
 	}
-	recipe.Content = "resource noop() {}"
+	recipe.Content = "import { $ } from \"bun\"\nawait $`echo updated`\n"
 	if _, e = s.UpdateRecipe(ctx, recipe.ID, recipe); e != nil {
 		t.Fatal(e)
 	}
@@ -71,11 +60,11 @@ func TestServerAndRecipeCRUD(t *testing.T) {
 func TestRunnerPersistsFailedExecution(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStore(t)
-	recipe, e := s.CreateRecipe(ctx, Recipe{Name: "run", Content: "# test"})
+	recipe, e := s.CreateRecipe(ctx, Recipe{Name: "run", Content: "console.log('test')\n"})
 	if e != nil {
 		t.Fatal(e)
 	}
-	run, e := (Runner{Store: s, Executable: "/definitely/not-a-command"}).Run(ctx, recipe.ID, nil, 0)
+	run, e := (Runner{Store: s, NixShellExecutable: "/definitely/not-a-command"}).Run(ctx, recipe.ID, nil, 0)
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -95,7 +84,7 @@ func TestRunnerBuildsRemoteSSHCommand(t *testing.T) {
 	s := newTestStore(t)
 	server := Server{Host: "mini3", Port: 2222, Username: "andrei"}
 	id := int64(1)
-	cmd, e := (Runner{Store: s, SSHExecutable: "ssh-test", ConvergedTimeout: 2}).command(context.Background(), &id, server, "noop \"test\" {}\n", 60)
+	cmd, e := (Runner{Store: s, SSHExecutable: "ssh-test"}).command(context.Background(), &id, server, "import { $ } from \"bun\"\nawait $`echo hi`\n", 60)
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -103,21 +92,19 @@ func TestRunnerBuildsRemoteSSHCommand(t *testing.T) {
 		t.Fatalf("ssh executable=%q", cmd.Path)
 	}
 	joined := strings.Join(cmd.Args, " ")
-	for _, want := range []string{"-p 2222", "mktemp /tmp/devbox-manager.XXXXXX.mcl", "log=${recipe%.mcl}.log", "lock=/tmp/devbox-manager-mgmt.lock", "flock -n 9", "another mgmt run is active", "mgmt run --tmp-prefix --no-watch --no-stream-watch --no-deploy-watch --converged-timeout 2 --max-runtime 60 lang \"$recipe\" >\"$log\" 2>&1 &", "devbox-manager: mgmt pid: $pid", "tail -n +1 -f --pid=\"$pid\" \"$log\" &", "wait \"$tailpid\" || true", "wait \"$pid\""} {
+	for _, want := range []string{"-p 2222", "mktemp /tmp/devbox-manager.XXXXXX.ts", "log=${recipe%.ts}.log", "lock=/tmp/devbox-manager-bun.lock", "flock -n 9", "another bun run is active", `nix-shell -p bun --run "timeout 60 bun \"$recipe\""`, "devbox-manager: bun pid: $pid", "tail -n +1 -f --pid=\"$pid\" \"$log\" &", "wait \"$tailpid\" || true", "wait \"$pid\""} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("command %q does not contain %q", joined, want)
 		}
 	}
-	for _, unexpected := range []string{"--converger-timeout", "--converged-exit"} {
-		if strings.Contains(joined, unexpected) {
-			t.Fatalf("remote command unexpectedly contains %q: %q", unexpected, joined)
-		}
+	if strings.Contains(joined, "mgmt") {
+		t.Fatalf("remote command unexpectedly mentions mgmt: %q", joined)
 	}
 }
 
 func TestAPIServerAndRecipe(t *testing.T) {
 	s := newTestStore(t)
-	api := API{Store: s, Runner: Runner{Store: s, Executable: "/not-found"}}
+	api := API{Store: s, Runner: Runner{Store: s, NixShellExecutable: "/not-found"}}
 	body := `{"name":"api-web","host":"198.51.100.1","port":22,"username":"ops"}`
 	req := httptest.NewRequest(http.MethodPost, "/api/servers", strings.NewReader(body))
 	rec := httptest.NewRecorder()
@@ -140,7 +127,7 @@ func TestGitCommitOnMutations(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	recipe, err := s.CreateRecipe(ctx, Recipe{Name: "demo", Content: "noop \"x\" {}\n"})
+	recipe, err := s.CreateRecipe(ctx, Recipe{Name: "demo", Content: "console.log('x')\n"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -152,7 +139,7 @@ func TestGitCommitOnMutations(t *testing.T) {
 		t.Fatal(err)
 	}
 	log := gitLog(t, s.Root)
-	for _, want := range []string{"added mini host", "added demo.mcl recipe"} {
+	for _, want := range []string{"added mini host", "added demo.ts recipe"} {
 		if !strings.Contains(log, want) {
 			t.Fatalf("git log missing %q:\n%s", want, log)
 		}
@@ -171,7 +158,7 @@ func TestGitCommitOnMutations(t *testing.T) {
 	if !fileExists(filepath.Join(s.Root, "logs", "1.json")) {
 		t.Fatal("run log file missing on disk")
 	}
-	if _, err := s.UpdateRecipe(ctx, recipe.ID, Recipe{Name: "demo", Content: "noop \"y\" {}\n"}); err != nil {
+	if _, err := s.UpdateRecipe(ctx, recipe.ID, Recipe{Name: "demo", Content: "console.log('y')\n"}); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.DeleteRecipe(ctx, recipe.ID); err != nil {
@@ -181,7 +168,7 @@ func TestGitCommitOnMutations(t *testing.T) {
 		t.Fatal(err)
 	}
 	log = gitLog(t, s.Root)
-	for _, want := range []string{"edited demo.mcl recipe", "removed demo.mcl recipe", "removed mini host"} {
+	for _, want := range []string{"edited demo.ts recipe", "removed demo.ts recipe", "removed mini host"} {
 		if !strings.Contains(log, want) {
 			t.Fatalf("git log missing %q:\n%s", want, log)
 		}

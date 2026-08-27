@@ -1,18 +1,7 @@
-// devbox-manager: mgmt · MCL recipe manager
+// devbox-manager: Bun shell recipe manager
 // Copyright (C) 2026  Andrei
 //
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-//
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU General Public License for more details.
-//
-// You should have received a copy of the GNU General Public License
-// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+// SPDX-License-Identifier: MIT
 
 package devbox
 
@@ -31,21 +20,22 @@ import (
 	"time"
 )
 
-var isolatedMgmtMu sync.Mutex
-
 type Runner struct {
-	Store            *Store
-	Events           *Broker
-	Executable       string
-	SSHExecutable    string
-	Seeds            string
-	ConvergedTimeout int
+	Store  *Store
+	Events *Broker
+	// SSHExecutable overrides the ssh binary (tests); empty defaults to "ssh".
+	SSHExecutable string
+	// NixShellExecutable overrides the nix-shell binary (tests); empty
+	// defaults to "nix-shell".
+	NixShellExecutable string
 }
 
-// Run executes locally when serverID is nil, otherwise it streams the recipe to
-// the selected server over SSH and executes mgmt there. SSH authentication uses
-// the service user's normal SSH configuration and agent.
-// maxRuntime is forwarded to mgmt as --max-runtime in seconds; 0 disables it.
+// Run executes the recipe locally when serverID is nil; otherwise it streams
+// the recipe to the selected server over SSH and executes it there. Recipes
+// are Bun shell scripts (https://bun.com/docs/runtime/shell) executed inside
+// `nix-shell -p bun`, so no bun install is required on either machine. SSH
+// authentication uses the service user's normal SSH configuration and agent.
+// maxRuntime caps each run in seconds (via coreutils timeout); 0 disables it.
 func (r Runner) Run(ctx context.Context, recipeID int64, serverID *int64, maxRuntime int) (Run, error) {
 	recipe, err := r.Store.GetRecipe(ctx, recipeID)
 	if err != nil {
@@ -60,7 +50,7 @@ func (r Runner) Run(ctx context.Context, recipeID int64, serverID *int64, maxRun
 	}
 	run, err := r.Store.CreateRun(ctx, recipe.ID, serverID)
 	if err != nil {
-		return Run{}, err
+		return run, err
 	}
 	if r.Events != nil {
 		r.Events.PublishRunStarted(run)
@@ -69,10 +59,6 @@ func (r Runner) Run(ctx context.Context, recipeID int64, serverID *int64, maxRun
 	cmd, err := r.command(ctx, serverID, server, recipe.Content, maxRuntime)
 	if err != nil {
 		return run, err
-	}
-	if serverID == nil && r.Seeds == "" {
-		isolatedMgmtMu.Lock()
-		defer isolatedMgmtMu.Unlock()
 	}
 	if serverID == nil && cmd.Dir != "" {
 		defer os.RemoveAll(cmd.Dir)
@@ -155,16 +141,20 @@ func (r Runner) execute(cmd *exec.Cmd, runID int64) ([]byte, error) {
 
 const outputPushInterval = 250 * time.Millisecond
 
+// bunInvocation is the shell snippet passed to `nix-shell --run`: bun (wrapped
+// in coreutils timeout when maxRuntime > 0) executing the recipe file.
+func bunInvocation(path string, maxRuntime int) string {
+	run := `bun "` + path + `"`
+	if maxRuntime > 0 {
+		run = "timeout " + strconv.Itoa(maxRuntime) + " " + run
+	}
+	return run
+}
+
 func (r Runner) command(ctx context.Context, serverID *int64, server Server, content string, maxRuntime int) (*exec.Cmd, error) {
-	args := []string{"run", "--tmp-prefix", "lang"}
-	if serverID == nil && r.Seeds != "" {
-		args = append(args, "--seeds="+r.Seeds)
-	}
-	if serverID == nil && r.ConvergedTimeout > 0 {
-		args = append(args, "--converger-timeout", strconv.Itoa(r.ConvergedTimeout), "--converged-exit")
-	}
-	if serverID == nil && maxRuntime > 0 {
-		args = append(args, "--max-runtime", strconv.Itoa(maxRuntime))
+	nix := r.NixShellExecutable
+	if nix == "" {
+		nix = "nix-shell"
 	}
 	if serverID != nil {
 		if strings.HasPrefix(server.Host, "-") || strings.ContainsAny(server.Host, "\r\n") || strings.ContainsAny(server.Username, "@\r\n") {
@@ -174,33 +164,25 @@ func (r Runner) command(ctx context.Context, serverID *int64, server Server, con
 		if ssh == "" {
 			ssh = "ssh"
 		}
-		remoteArgs := "run --tmp-prefix --no-watch --no-stream-watch --no-deploy-watch"
-		if r.ConvergedTimeout > 0 {
-			remoteArgs += " --converged-timeout " + strconv.Itoa(r.ConvergedTimeout)
-		}
-		if maxRuntime > 0 {
-			remoteArgs += " --max-runtime " + strconv.Itoa(maxRuntime)
-		}
-		remoteCommand := "recipe=$(mktemp /tmp/devbox-manager.XXXXXX.mcl); log=${recipe%.mcl}.log; lock=/tmp/devbox-manager-mgmt.lock; trap 'rm -f \"$recipe\"' EXIT; cat >\"$recipe\"; printf '%s\\n' \"devbox-manager: mgmt output: $log\"; if ! command -v flock >/dev/null 2>&1; then printf '%s\\n' 'devbox-manager: flock is required to serialize mgmt runs on this server' >&2; exit 1; fi; exec 9>\"$lock\"; if ! flock -n 9; then printf '%s\\n' \"devbox-manager: another mgmt run is active on this server; wait for it to finish before retrying\" >&2; exit 1; fi; mgmt " + remoteArgs + " lang \"$recipe\" >\"$log\" 2>&1 & pid=$!; printf '%s\\n' \"devbox-manager: mgmt pid: $pid\"; tail -n +1 -f --pid=\"$pid\" \"$log\" & tailpid=$!; wait \"$pid\"; status=$?; wait \"$tailpid\" || true; printf '%s\\n' \"devbox-manager: mgmt exited with status $status; log: $log\"; exit \"$status\""
+		// The recipe is piped over stdin into a temp file; flock serializes
+		// concurrent runs on that server; output streams back via tail -f. The
+		// inner quotes of the --run argument are escaped for the remote shell.
+		remoteRun := strings.ReplaceAll(bunInvocation("$recipe", maxRuntime), `"`, `\"`)
+		remoteCommand := `recipe=$(mktemp /tmp/devbox-manager.XXXXXX.ts); log=${recipe%.ts}.log; lock=/tmp/devbox-manager-bun.lock; trap 'rm -f "$recipe"' EXIT; cat >"$recipe"; printf '%s\n' "devbox-manager: bun output: $log"; if ! command -v flock >/dev/null 2>&1; then printf '%s\n' 'devbox-manager: flock is required to serialize bun runs on this server' >&2; exit 1; fi; exec 9>"$lock"; if ! flock -n 9; then printf '%s\n' "devbox-manager: another bun run is active on this server; wait for it to finish before retrying" >&2; exit 1; fi; ` + nix + ` -p bun --run "` + remoteRun + `" >"$log" 2>&1 & pid=$!; printf '%s\n' "devbox-manager: bun pid: $pid"; tail -n +1 -f --pid="$pid" "$log" & tailpid=$!; wait "$pid"; status=$?; wait "$tailpid" || true; printf '%s\n' "devbox-manager: bun exited with status $status; log: $log"; exit "$status"`
 		cmd := exec.CommandContext(ctx, ssh, "-p", strconv.Itoa(server.Port), "--", server.Username+"@"+server.Host, remoteCommand)
 		cmd.Stdin = strings.NewReader(content)
 		return cmd, nil
 	}
-	dir, err := os.MkdirTemp("", "devbox-manager-mcl-")
+	dir, err := os.MkdirTemp("", "devbox-manager-recipe-")
 	if err != nil {
 		return nil, err
 	}
-	path := filepath.Join(dir, "recipe.mcl")
+	path := filepath.Join(dir, "recipe.ts")
 	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
 		_ = os.RemoveAll(dir)
 		return nil, err
 	}
-	args = append(args, path)
-	exe := r.Executable
-	if exe == "" {
-		exe = "mgmt"
-	}
-	cmd := exec.CommandContext(ctx, exe, args...)
+	cmd := exec.CommandContext(ctx, nix, "-p", "bun", "--run", bunInvocation(path, maxRuntime))
 	cmd.Dir = dir
 	return cmd, nil
 }

@@ -1,18 +1,7 @@
-// devbox-manager: mgmt · MCL recipe manager
+// devbox-manager: Bun shell recipe manager
 // Copyright (C) 2026  Andrei
 //
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-//
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU General Public License for more details.
-//
-// You should have received a copy of the GNU General Public License
-// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+// SPDX-License-Identifier: MIT
 
 package devbox
 
@@ -39,7 +28,7 @@ var ErrNotFound = errors.New("not found")
 // Store is a file-backed inventory under Root:
 //
 //	hosts.yml          server inventory
-//	recipes/*.mcl      MCL recipe bodies (name = basename)
+//	recipes/*.ts       Bun shell recipe bodies (name = basename)
 //	logs/*.json        run records (gitignored)
 //
 // Root is also a nested git repository, ignored by the parent project repo.
@@ -121,7 +110,7 @@ func (s *Store) recipesIndexPath() string {
 }
 func (s *Store) logsDir() string { return filepath.Join(s.Root, "logs") }
 func (s *Store) recipePath(name string) string {
-	return filepath.Join(s.recipesDir(), name+".mcl")
+	return filepath.Join(s.recipesDir(), name+".ts")
 }
 
 func (s *Store) ensureLayout() error {
@@ -492,7 +481,7 @@ func (s *Store) CreateRecipe(ctx context.Context, v Recipe) (Recipe, error) {
 	if err := s.writeRecipesIndex(idx); err != nil {
 		return v, err
 	}
-	if err := s.commit(fmt.Sprintf("added %s.mcl recipe", v.Name), "recipes.yml", filepath.Join("recipes", v.Name+".mcl")); err != nil {
+	if err := s.commit(fmt.Sprintf("added %s.ts recipe", v.Name), "recipes.yml", filepath.Join("recipes", v.Name+".ts")); err != nil {
 		return v, err
 	}
 	return v, nil
@@ -539,13 +528,13 @@ func (s *Store) UpdateRecipe(ctx context.Context, id int64, v Recipe) (Recipe, e
 	if err := s.writeRecipesIndex(idx); err != nil {
 		return v, err
 	}
-	paths := []string{"recipes.yml", filepath.Join("recipes", v.Name+".mcl")}
+	paths := []string{"recipes.yml", filepath.Join("recipes", v.Name+".ts")}
 	if prev.Name != v.Name {
 		// Stage deletion of old path if rename left git tracking the old name.
-		_ = s.git("rm", "--cached", "--ignore-unmatch", filepath.Join("recipes", prev.Name+".mcl"))
-		paths = append(paths, filepath.Join("recipes", prev.Name+".mcl"))
+		_ = s.git("rm", "--cached", "--ignore-unmatch", filepath.Join("recipes", prev.Name+".ts"))
+		paths = append(paths, filepath.Join("recipes", prev.Name+".ts"))
 	}
-	if err := s.commit(fmt.Sprintf("edited %s.mcl recipe", v.Name), paths...); err != nil {
+	if err := s.commit(fmt.Sprintf("edited %s.ts recipe", v.Name), paths...); err != nil {
 		return v, err
 	}
 	return v, nil
@@ -575,8 +564,8 @@ func (s *Store) DeleteRecipe(ctx context.Context, id int64) error {
 	if err := s.writeRecipesIndex(idx); err != nil {
 		return err
 	}
-	_ = s.git("rm", "--cached", "--ignore-unmatch", filepath.Join("recipes", name+".mcl"))
-	return s.commit(fmt.Sprintf("removed %s.mcl recipe", name), "recipes.yml", filepath.Join("recipes", name+".mcl"))
+	_ = s.git("rm", "--cached", "--ignore-unmatch", filepath.Join("recipes", name+".ts"))
+	return s.commit(fmt.Sprintf("removed %s.ts recipe", name), "recipes.yml", filepath.Join("recipes", name+".ts"))
 }
 
 func (s *Store) runPath(id int64) string {

@@ -1,19 +1,18 @@
 # devbox-manager
 
 A local, unauthenticated Go backend and CLI for server inventory and
-[mgmt](https://github.com/purpleidea/mgmt) MCL recipe management, with an
-embedded SolidJS+TS single-page UI. Licensed GPL-3.0-or-later (see `LICENSE`),
-same as mgmt — every source file starts with the short GPL header comment.
+[Bun shell](https://bun.com/docs/runtime/shell) recipe management, with an
+embedded SolidJS+TS single-page UI. Licensed MIT (see `LICENSE`) — every
+source file starts with the short MIT header comment.
 
 ## Layout
 
 - `cmd/devbox-manager/main.go` — CLI entry point (`serve`, `service`, `server`,
   `recipe` subcommands); `//go:embed web` bundles the built SPA.
 - `internal/devbox/` — file store under `data/` (`store.go`: `hosts.yml`,
-  `recipes/*.mcl`, `logs/*.json`), HTTP/JSON API (`http.go`), mgmt runner
-  (`run.go`). `data/` is a nested private git repo ignored by the parent.
-- `web/` — SolidJS SPA. `src/main.tsx` is the app, `src/builder.ts` the pure
-  MCL parser/emitter model for the Builder tab (no React/Solid imports).
+  `recipes/*.ts`, `logs/*.json`), HTTP/JSON API (`http.go`), bun/nix-shell
+  runner (`run.go`). `data/` is a nested private git repo ignored by the parent.
+- `web/` — SolidJS SPA; `src/main.tsx` is the whole app.
 - `bin/devbox-manager` — the built binary the systemd user service runs.
 
 ## Build, test, deploy loop
@@ -45,26 +44,18 @@ managed through the CLI itself:
 
 Never `pkill` the server; systemd just restarts it. Use `service restart`.
 
-## Builder parser tests
-
-`web/src/builder.ts` is validated with a Node harness (strip-types);
-
-```sh
-cp web/src/builder.ts /tmp/opencode/builder-test.mts
-node --experimental-strip-types /tmp/opencode/builder-test-run.mts   # ALL PASS expected
-```
-
 ## UI craft gates
 
 Before shipping UI changes: run
 `node ~/.agents/skills/impeccable/scripts/detect.mjs --json web/src/main.tsx web/src/styles.css`
 and expect `[]`. No emojis, drawn SVG icons only, English UI copy.
 
-## mgmt facts
+## Recipe runtime facts
 
-Installed binary targets mgmt 1.1.0 at `/home/andrei/.local/bin/mgmt`
-(`mgmt run --tmp-prefix lang <file.mcl>`);
-MCL there **requires trailing commas** on attribute lines. The Builder preserves
-unrecognised MCL verbatim as raw nodes; known resource kinds are
-pkg/file/exec/svc/noop/print/void. Recipe runs honor `-max-runtime N` (CLI) and
-`max_runtime` (API, 0..86400 seconds, 0 = no limit).
+Recipes are Bun shell scripts (`import { $ } from "bun"`). Runs execute inside
+`nix-shell -p bun` — locally, or over SSH when a server context is checked
+(the recipe is piped to the server over stdin and run the same way there).
+`nix-shell` must exist on the executing machine; bun is fetched by nix.
+`--max-runtime N` (CLI) / `max_runtime` (API, 0..86400 seconds, 0 = no limit)
+wraps the run in coreutils `timeout`. Remote runs are serialized per server
+with `flock` (`/tmp/devbox-manager-bun.lock` on the server).
