@@ -7,6 +7,7 @@ package devbox
 
 import (
 	"context"
+	"encoding/base64"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -93,9 +94,19 @@ func TestRunnerBuildsRemoteSSHCommand(t *testing.T) {
 		t.Fatalf("ssh executable=%q", cmd.Path)
 	}
 	joined := strings.Join(cmd.Args, " ")
-	for _, want := range []string{"-p 2222", "mktemp /tmp/devbox-manager.XXXXXX.ts", "log=${recipe%.ts}.log", "lock=/tmp/devbox-manager-bun.lock", "flock -n 9", "another bun run is active", `nix-shell -p bun --run "timeout 60 bun \"$recipe\""`, "devbox-manager: bun pid: $pid", "tail -n +1 -f --pid=\"$pid\" \"$log\" &", "wait \"$tailpid\" || true", "wait \"$pid\""} {
+	for _, want := range []string{"-p 2222", "env DBM_REMOTE_COMMAND=", `bash -c 'exec bash <(printf %s "$DBM_REMOTE_COMMAND" | base64 -d)'`} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("command %q does not contain %q", joined, want)
+		}
+	}
+	encoded := strings.TrimPrefix(strings.Fields(cmd.Args[len(cmd.Args)-1])[1], "DBM_REMOTE_COMMAND=")
+	launcher, e := base64.StdEncoding.DecodeString(encoded)
+	if e != nil {
+		t.Fatalf("decode launcher: %v", e)
+	}
+	for _, want := range []string{"mktemp /tmp/devbox-manager.XXXXXX.ts", "log=${recipe%.ts}.log", "lock=/tmp/devbox-manager-bun.lock", "flock -n 9", "another bun run is active", `nix-shell -p bun --run "timeout 60 bun \"$recipe\""`, "devbox-manager: bun pid: $pid", "tail -n +1 -f --pid=\"$pid\" \"$log\" &", "wait \"$tailpid\" || true", "wait \"$pid\""} {
+		if !strings.Contains(string(launcher), want) {
+			t.Fatalf("launcher %q does not contain %q", launcher, want)
 		}
 	}
 	if strings.Contains(joined, "mgmt") {

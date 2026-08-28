@@ -10,6 +10,7 @@ import (
 	"bytes"
 	"context"
 	_ "embed"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"io"
@@ -178,6 +179,10 @@ func (r Runner) command(ctx context.Context, serverID *int64, server Server, con
 		// inner quotes of the --run argument are escaped for the remote shell.
 		remoteRun := strings.ReplaceAll(bunInvocation("$recipe", maxRuntime), `"`, `\"`)
 		remoteCommand := `recipe=$(mktemp /tmp/devbox-manager.XXXXXX.ts); log=${recipe%.ts}.log; lock=/tmp/devbox-manager-bun.lock; trap 'rm -f "$recipe"' EXIT; cat >"$recipe"; printf '%s\n' "devbox-manager: bun output: $log"; if ! command -v flock >/dev/null 2>&1; then printf '%s\n' 'devbox-manager: flock is required to serialize bun runs on this server' >&2; exit 1; fi; exec 9>"$lock"; if ! flock -n 9; then printf '%s\n' "devbox-manager: another bun run is active on this server; wait for it to finish before retrying" >&2; exit 1; fi; ` + nix + ` -p bun --run "` + remoteRun + `" >"$log" 2>&1 & pid=$!; printf '%s\n' "devbox-manager: bun pid: $pid"; tail -n +1 -f --pid="$pid" "$log" & tailpid=$!; wait "$pid"; status=$?; wait "$tailpid" || true; printf '%s\n' "devbox-manager: bun exited with status $status; log: $log"; exit "$status"`
+		// SSH starts the account's login shell for remote commands. Encode the
+		// Bash launcher so Fish does not need to parse its POSIX syntax. The
+		// process substitution keeps SSH stdin available for the recipe body.
+		remoteCommand = encodedBashCommand(remoteCommand)
 		cmd := exec.CommandContext(ctx, ssh, "-p", strconv.Itoa(server.Port), "--", server.Username+"@"+server.Host, remoteCommand)
 		cmd.Stdin = strings.NewReader(content)
 		return cmd, nil
@@ -194,6 +199,11 @@ func (r Runner) command(ctx context.Context, serverID *int64, server Server, con
 	cmd := exec.CommandContext(ctx, nix, "-p", "bun", "--run", bunInvocation(path, maxRuntime))
 	cmd.Dir = dir
 	return cmd, nil
+}
+
+func encodedBashCommand(script string) string {
+	encoded := base64.StdEncoding.EncodeToString([]byte(script))
+	return `env DBM_REMOTE_COMMAND=` + encoded + ` bash -c 'exec bash <(printf %s "$DBM_REMOTE_COMMAND" | base64 -d)'`
 }
 
 // serverEnvironment makes saved server secrets available to the Bun process
