@@ -44,14 +44,14 @@ func TestServerAndRecipeCRUD(t *testing.T) {
 		t.Fatal(e)
 	}
 	recipe.Content = "import { $ } from \"bun\"\nawait $`echo updated`\n"
-	if _, e = s.UpdateRecipe(ctx, recipe.ID, recipe); e != nil {
+	if _, e = s.UpdateRecipe(ctx, recipe.Name, recipe); e != nil {
 		t.Fatal(e)
 	}
-	runs, e := s.ListRuns(ctx, recipe.ID)
+	runs, e := s.ListRuns(ctx, recipe.Name)
 	if e != nil || len(runs) != 0 {
 		t.Fatalf("runs=%v err=%v", runs, e)
 	}
-	if e = s.DeleteRecipe(ctx, recipe.ID); e != nil {
+	if e = s.DeleteRecipe(ctx, recipe.Name); e != nil {
 		t.Fatal(e)
 	}
 	if e = s.DeleteServer(ctx, server.ID); e != nil {
@@ -66,7 +66,7 @@ func TestRunnerPersistsFailedExecution(t *testing.T) {
 	if e != nil {
 		t.Fatal(e)
 	}
-	run, e := (Runner{Store: s, NixShellExecutable: "/definitely/not-a-command"}).Run(ctx, recipe.ID, nil, 0)
+	run, e := (Runner{Store: s, NixShellExecutable: "/definitely/not-a-command"}).Run(ctx, recipe.Name, nil, 0)
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -116,7 +116,12 @@ func TestRunnerBuildsRemoteSSHCommand(t *testing.T) {
 	if e != nil {
 		t.Fatal(e)
 	}
-	for _, want := range []string{"devboxEnsureNixPort", "import { $ } from \"bun\"", "await $`echo hi`"} {
+	// The store ships without helpers, so the injected body must be exactly
+	// the server secrets prologue plus the recipe itself.
+	if _, err := os.Stat(filepath.Join(s.Root, "recipes", "_helpers")); !os.IsNotExist(err) {
+		t.Fatalf("helpers dir unexpectedly present: %v", err)
+	}
+	for _, want := range []string{"import { $ } from \"bun\"", "await $`echo hi`"} {
 		if !strings.Contains(string(body), want) {
 			t.Fatalf("injected recipe does not contain %q", want)
 		}
@@ -126,6 +131,41 @@ func TestRunnerBuildsRemoteSSHCommand(t *testing.T) {
 	}
 	if strings.Contains(joined, "top secret") {
 		t.Fatalf("remote command exposes secret: %q", joined)
+	}
+}
+
+func TestLocalServerRunsNativeBunWithSecrets(t *testing.T) {
+	s := newTestStore(t)
+	local, err := s.ListServers(context.Background())
+	if err != nil || len(local) == 0 || local[0].Name != localServerName {
+		t.Fatalf("local server=%+v err=%v", local, err)
+	}
+	server := local[0]
+	server.Secrets = map[string]string{"LOCAL_TOKEN": "secret"}
+	cmd, err := (Runner{Store: s, BunExecutable: "bun-test"}).command(context.Background(), &server.ID, server, "console.log(process.env.LOCAL_TOKEN)\n", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(cmd.Dir)
+	if cmd.Path != "bun-test" {
+		t.Fatalf("bun executable=%q", cmd.Path)
+	}
+	body, err := os.ReadFile(cmd.Args[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(body), `Object.assign(process.env, {"LOCAL_TOKEN":"secret"})`) {
+		t.Fatalf("local recipe did not receive secrets: %q", body)
+	}
+}
+
+func TestLocalServerValidation(t *testing.T) {
+	clean, err := cleanServer(Server{Name: "LOCAL", Host: "should-not-be-used", Port: 22, Username: "ignored"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if clean.Name != localServerName || clean.Host != "" || clean.Port != 0 || clean.Username != "" {
+		t.Fatalf("clean local server=%+v", clean)
 	}
 }
 
@@ -161,6 +201,18 @@ func TestAPIServerAndRecipe(t *testing.T) {
 	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "api-web") {
 		t.Fatalf("list servers status=%d body=%s", rec.Code, rec.Body.String())
 	}
+	req = httptest.NewRequest(http.MethodPost, "/api/recipe-folders", strings.NewReader(`{"path":"api/empty"}`))
+	rec = httptest.NewRecorder()
+	api.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create folder status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	req = httptest.NewRequest(http.MethodGet, "/api/recipe-folders", nil)
+	rec = httptest.NewRecorder()
+	api.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "api/empty") {
+		t.Fatalf("list folders status=%d body=%s", rec.Code, rec.Body.String())
+	}
 }
 
 func TestGitCommitOnMutations(t *testing.T) {
@@ -174,7 +226,7 @@ func TestGitCommitOnMutations(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	run, err := s.CreateRun(ctx, recipe.ID, &server.ID)
+	run, err := s.CreateRun(ctx, recipe.Name, &server.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -201,10 +253,10 @@ func TestGitCommitOnMutations(t *testing.T) {
 	if !fileExists(filepath.Join(s.Root, "logs", "1.json")) {
 		t.Fatal("run log file missing on disk")
 	}
-	if _, err := s.UpdateRecipe(ctx, recipe.ID, Recipe{Name: "demo", Content: "console.log('y')\n"}); err != nil {
+	if _, err := s.UpdateRecipe(ctx, recipe.Name, Recipe{Name: "demo", Content: "console.log('y')\n"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.DeleteRecipe(ctx, recipe.ID); err != nil {
+	if err := s.DeleteRecipe(ctx, recipe.Name); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.DeleteServer(ctx, server.ID); err != nil {
@@ -215,6 +267,100 @@ func TestGitCommitOnMutations(t *testing.T) {
 		if !strings.Contains(log, want) {
 			t.Fatalf("git log missing %q:\n%s", want, log)
 		}
+	}
+}
+
+func TestRecipeFoldersAndNestedRecipes(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+	if _, err := s.CreateRecipeFolder(ctx, "web/tools"); err != nil {
+		t.Fatal(err)
+	}
+	// idempotent
+	if _, err := s.CreateRecipeFolder(ctx, "web/tools"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CreateRecipe(ctx, Recipe{Name: "web/tools/deploy", Content: "console.log('deploy')\n"}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.ListRecipes(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].Name != "web/tools/deploy" {
+		t.Fatalf("recipes=%+v", got)
+	}
+	folders, err := s.ListRecipeFolders(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(folders, ",") != "web,web/tools" {
+		t.Fatalf("folders=%v", folders)
+	}
+	// underscore dirs are skipped by the scan
+	if err := os.MkdirAll(filepath.Join(s.recipesDir(), "_helpers"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(s.recipesDir(), "_helpers", "x.ts"), []byte("// helper"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got, err = s.ListRecipes(ctx)
+	if err != nil || len(got) != 1 {
+		t.Fatalf("recipes=%+v err=%v", got, err)
+	}
+	// moving a recipe to another folder via update
+	if _, err := s.UpdateRecipe(ctx, "web/tools/deploy", Recipe{Name: "web/deploy", Content: "console.log('moved')\n"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.GetRecipe(ctx, "web/deploy"); err != nil {
+		t.Fatalf("moved recipe missing: %v", err)
+	}
+	if fileExists(filepath.Join(s.recipesDir(), "web", "tools", "deploy.ts")) {
+		t.Fatal("old recipe path still exists after move")
+	}
+	// deleting leaves no empty nested dirs
+	if err := s.DeleteRecipe(ctx, "web/deploy"); err != nil {
+		t.Fatal(err)
+	}
+	if fileExists(filepath.Join(s.recipesDir(), "web", "deploy.ts")) {
+		t.Fatal("deleted recipe still on disk")
+	}
+	// underscore segments are rejected
+	if _, err := s.CreateRecipe(ctx, Recipe{Name: "_bad", Content: "x"}); err == nil {
+		t.Fatal("expected error for underscore-prefixed name")
+	}
+	if _, err := s.CreateRecipe(ctx, Recipe{Name: "../escape", Content: "x"}); err == nil {
+		t.Fatal("expected error for traversal name")
+	}
+}
+
+func TestRecipeHelpersConcatenation(t *testing.T) {
+	s := newTestStore(t)
+	dir := s.helpersDir()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "b-nix.ts"), []byte("import { $ } from \"bun\"\nexport async function ensure() { await $`nix-env --version` }"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "a-node.ts"), []byte("import { $ } from \"bun\"\nexport async function node() { await $`node -v` }"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out, err := s.RecipeHelpers()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// exactly one hoisted bun import, bodies sorted by file name
+	if strings.Count(out, "from \"bun\"") != 1 {
+		t.Fatalf("helpers should hoist a single bun import: %q", out)
+	}
+	aIdx := strings.Index(out, "node()")
+	bIdx := strings.Index(out, "ensure()")
+	if aIdx < 0 || bIdx < 0 || aIdx > bIdx {
+		t.Fatalf("helpers not ordered by file name: %q", out)
+	}
+	if !strings.HasPrefix(out, "import { $ } from \"bun\"\n") {
+		t.Fatalf("import should be hoisted to the top: %q", out)
 	}
 }
 

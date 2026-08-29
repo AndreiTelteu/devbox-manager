@@ -9,7 +9,6 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	_ "embed"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -31,6 +30,9 @@ type Runner struct {
 	// NixShellExecutable overrides the nix-shell binary (tests); empty
 	// defaults to "nix-shell".
 	NixShellExecutable string
+	// BunExecutable overrides the Bun binary for the special local host; empty
+	// defaults to "bun".
+	BunExecutable string
 }
 
 // Run executes the recipe locally when serverID is nil; otherwise it streams
@@ -39,8 +41,8 @@ type Runner struct {
 // `nix-shell -p bun`, so no bun install is required on either machine. SSH
 // authentication uses the service user's normal SSH configuration and agent.
 // maxRuntime caps each run in seconds (via coreutils timeout); 0 disables it.
-func (r Runner) Run(ctx context.Context, recipeID int64, serverID *int64, maxRuntime int) (Run, error) {
-	recipe, err := r.Store.GetRecipe(ctx, recipeID)
+func (r Runner) Run(ctx context.Context, recipeName string, serverID *int64, maxRuntime int) (Run, error) {
+	recipe, err := r.Store.GetRecipe(ctx, recipeName)
 	if err != nil {
 		return Run{}, err
 	}
@@ -51,7 +53,7 @@ func (r Runner) Run(ctx context.Context, recipeID int64, serverID *int64, maxRun
 			return Run{}, err
 		}
 	}
-	run, err := r.Store.CreateRun(ctx, recipe.ID, serverID)
+	run, err := r.Store.CreateRun(ctx, recipe.Name, serverID)
 	if err != nil {
 		return run, err
 	}
@@ -63,7 +65,7 @@ func (r Runner) Run(ctx context.Context, recipeID int64, serverID *int64, maxRun
 	if err != nil {
 		return run, err
 	}
-	if serverID == nil && cmd.Dir != "" {
+	if cmd.Dir != "" {
 		defer os.RemoveAll(cmd.Dir)
 	}
 	output, execErr := r.execute(cmd, run.ID)
@@ -144,12 +146,6 @@ func (r Runner) execute(cmd *exec.Cmd, runID int64) ([]byte, error) {
 
 const outputPushInterval = 250 * time.Millisecond
 
-// recipeHelpers is prepended to every recipe, including scripts streamed over
-// SSH, so common Bun helpers do not need to be duplicated in recipe files.
-//
-//go:embed recipe_helpers.ts
-var recipeHelpers string
-
 // bunInvocation is the shell snippet passed to `nix-shell --run`: bun (wrapped
 // in coreutils timeout when maxRuntime > 0) executing the recipe file.
 func bunInvocation(path string, maxRuntime int) string {
@@ -161,7 +157,17 @@ func bunInvocation(path string, maxRuntime int) string {
 }
 
 func (r Runner) command(ctx context.Context, serverID *int64, server Server, content string, maxRuntime int) (*exec.Cmd, error) {
-	content = recipeHelpers + "\n" + serverEnvironment(server.Secrets) + content
+	helpers, err := r.Store.RecipeHelpers()
+	if err != nil {
+		return nil, err
+	}
+	if helpers != "" {
+		content = helpers + "\n" + content
+	}
+	content = serverEnvironment(server.Secrets) + content
+	if serverID != nil && isLocalServer(server) {
+		return r.localCommand(ctx, content, maxRuntime)
+	}
 	nix := r.NixShellExecutable
 	if nix == "" {
 		nix = "nix-shell"
@@ -197,6 +203,40 @@ func (r Runner) command(ctx context.Context, serverID *int64, server Server, con
 		return nil, err
 	}
 	cmd := exec.CommandContext(ctx, nix, "-p", "bun", "--run", bunInvocation(path, maxRuntime))
+	cmd.Dir = dir
+	return cmd, nil
+}
+
+// localCommand runs recipes on the Debian host that runs devbox-manager. Bun
+// is installed there directly, so this deliberately does not involve Nix.
+func (r Runner) localCommand(ctx context.Context, content string, maxRuntime int) (*exec.Cmd, error) {
+	dir, err := os.MkdirTemp("", "devbox-manager-recipe-")
+	if err != nil {
+		return nil, err
+	}
+	path := filepath.Join(dir, "recipe.ts")
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		_ = os.RemoveAll(dir)
+		return nil, err
+	}
+	bun := r.BunExecutable
+	if bun == "" {
+		bun = "bun"
+		if _, err := exec.LookPath(bun); err != nil {
+			if home, homeErr := os.UserHomeDir(); homeErr == nil {
+				candidate := filepath.Join(home, ".bun", "bin", "bun")
+				if _, statErr := os.Stat(candidate); statErr == nil {
+					bun = candidate
+				}
+			}
+		}
+	}
+	var cmd *exec.Cmd
+	if maxRuntime > 0 {
+		cmd = exec.CommandContext(ctx, "timeout", strconv.Itoa(maxRuntime), bun, path)
+	} else {
+		cmd = exec.CommandContext(ctx, bun, path)
+	}
 	cmd.Dir = dir
 	return cmd, nil
 }

@@ -6,8 +6,8 @@
 import { createSignal, onCleanup } from 'solid-js'
 
 export type Server = { id: number; name: string; host: string; port: number; username: string; secrets?: Record<string, string>; created_at: string; updated_at: string }
-export type Recipe = { id: number; name: string; content: string; created_at: string; updated_at: string }
-export type Run = { id: number; recipe_id: number; server_id?: number | null; status: 'running' | 'succeeded' | 'failed'; exit_code?: number | null; output: string; started_at: string; finished_at?: string | null }
+export type Recipe = { name: string; content: string; created_at: string; updated_at: string }
+export type Run = { id: number; recipe: string; server_id?: number | null; status: 'running' | 'succeeded' | 'failed'; exit_code?: number | null; output: string; started_at: string; finished_at?: string | null }
 
 async function api<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`/api${path}`, { headers: { 'Content-Type': 'application/json', ...(init?.headers ?? {}) }, ...init })
@@ -20,6 +20,7 @@ async function api<T>(path: string, init?: RequestInit): Promise<T> {
 export type AppState = {
   servers: Server[]
   recipes: Recipe[]
+  folders: string[]
   runs: Run[]
   loaded: boolean
   live: boolean
@@ -48,7 +49,7 @@ function createStore<T extends object>(initial: T): Store<T> {
   }
 }
 
-const appStore = createStore<AppState>({ servers: [], recipes: [], runs: [], loaded: false, live: false })
+const appStore = createStore<AppState>({ servers: [], recipes: [], folders: [], runs: [], loaded: false, live: false })
 
 // useAppSelector subscribes a component to one slice of the global state,
 // mirroring zustand's selector hook. Identity-stable slices avoid rerenders.
@@ -61,7 +62,7 @@ export function useAppSelector<S>(selector: (s: AppState) => S): () => S {
 // Runs keep their object identity while nothing observable changes, so Solid's
 // keyed rendering never recreates dock rows (which used to steal focus).
 const sameRunState = (a: Run, b: Run) =>
-  a.recipe_id === b.recipe_id &&
+  a.recipe === b.recipe &&
   (a.server_id ?? null) === (b.server_id ?? null) &&
   a.status === b.status &&
   a.output === b.output &&
@@ -82,8 +83,11 @@ function reconcileRuns(current: Run[], incoming: Run[]): Run[] | null {
 
 export const store = {
   loadAll: async () => {
-    const [servers, recipes, runs] = await Promise.all([api<Server[]>('/servers'), api<Recipe[]>('/recipes'), api<Run[]>('/runs')])
-    appStore.setState({ servers, recipes, runs: runs ?? [], loaded: true })
+    const [servers, recipes, folders, runs] = await Promise.all([api<Server[]>('/servers'), api<Recipe[]>('/recipes'), api<string[]>('/recipe-folders'), api<Run[]>('/runs')])
+    appStore.setState({ servers, recipes, folders: folders ?? [], runs: runs ?? [], loaded: true })
+  },
+  createRecipeFolder: async (path: string) => {
+    await api('/recipe-folders', { method: 'POST', body: JSON.stringify({ path }) })
   },
   refreshRuns: async () => {
     try {

@@ -326,10 +326,9 @@ func recipe(ctx context.Context, s *devbox.Store, args []string) error {
 		return print(v)
 	case "create", "update":
 		fs := flag.NewFlagSet("recipe "+args[0], flag.ContinueOnError)
-		name := fs.String("name", "", "recipe name")
+		name := fs.String("name", "", "recipe name (slash path, e.g. web/deploy)")
 		content := fs.String("content", "", "Bun shell script content")
 		file := fs.String("file", "", "read recipe content from file")
-		id := fs.Int64("id", 0, "recipe id (update)")
 		if e := fs.Parse(args[1:]); e != nil {
 			return e
 		}
@@ -340,15 +339,15 @@ func recipe(ctx context.Context, s *devbox.Store, args []string) error {
 			}
 			*content = string(b)
 		}
+		if *name == "" {
+			return errors.New("--name is required")
+		}
 		v := devbox.Recipe{Name: *name, Content: *content}
 		var e error
 		if args[0] == "create" {
 			v, e = s.CreateRecipe(ctx, v)
 		} else {
-			if *id < 1 {
-				return errors.New("--id is required")
-			}
-			v, e = s.UpdateRecipe(ctx, *id, v)
+			v, e = s.UpdateRecipe(ctx, *name, v)
 		}
 		if e != nil {
 			return e
@@ -356,30 +355,30 @@ func recipe(ctx context.Context, s *devbox.Store, args []string) error {
 		return print(v)
 	case "delete":
 		fs := flag.NewFlagSet("recipe delete", flag.ContinueOnError)
-		id := fs.Int64("id", 0, "recipe id")
+		name := fs.String("name", "", "recipe name (slash path)")
 		if e := fs.Parse(args[1:]); e != nil {
 			return e
 		}
-		if *id < 1 {
-			return errors.New("--id is required")
+		if *name == "" {
+			return errors.New("--name is required")
 		}
-		return s.DeleteRecipe(ctx, *id)
+		return s.DeleteRecipe(ctx, *name)
 	case "run":
 		fs := flag.NewFlagSet("recipe run", flag.ContinueOnError)
-		id := fs.Int64("id", 0, "recipe id")
+		name := fs.String("name", "", "recipe name (slash path)")
 		serverID := fs.Int64("server-id", 0, "optional server id to execute on over SSH")
 		maxRuntime := fs.Int("max-runtime", 0, "seconds before this run is killed (0 disables)")
 		if e := fs.Parse(args[1:]); e != nil {
 			return e
 		}
-		if *id < 1 {
-			return errors.New("--id is required")
+		if *name == "" {
+			return errors.New("--name is required")
 		}
 		var sp *int64
 		if *serverID > 0 {
 			sp = serverID
 		}
-		v, e := (devbox.Runner{Store: s}).Run(ctx, *id, sp, *maxRuntime)
+		v, e := (devbox.Runner{Store: s}).Run(ctx, *name, sp, *maxRuntime)
 		if e != nil {
 			return e
 		}

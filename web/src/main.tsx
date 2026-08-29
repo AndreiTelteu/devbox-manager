@@ -40,18 +40,20 @@ const icons = {
   box: 'M21 8l-9-5-9 5v8l9 5 9-5zM3 8l9 5 9-5M12 13v8',
   check: 'M5 12.5l4.5 4.5L19 7.5',
   eye: 'M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7zm10 3a3 3 0 1 0 0-6 3 3 0 0 0 0 6z',
+  chevron: 'm9 18 6-6-6-6',
+  folder: 'M3 6.5A2.5 2.5 0 0 1 5.5 4H10l2 2.5h6.5A2.5 2.5 0 0 1 21 9v8.5a2.5 2.5 0 0 1-2.5 2.5h-13A2.5 2.5 0 0 1 3 17.5z',
+  plus: 'M12 5v14M5 12h14',
 }
 
-const LOCAL_CONTEXT = 'local'
 const CONTEXTS_KEY = 'devbox.run-contexts'
 const MAXRT_KEY = 'devbox.max-runtime'
 const loadRunContexts = (): string[] => {
   const stored = localStorage.getItem(CONTEXTS_KEY)
-  if (stored === null) return [LOCAL_CONTEXT]
+  if (stored === null) return []
   try {
     const raw: unknown = JSON.parse(stored)
-    return Array.isArray(raw) ? raw.filter((v): v is string => typeof v === 'string') : [LOCAL_CONTEXT]
-  } catch { return [LOCAL_CONTEXT] }
+    return Array.isArray(raw) ? raw.filter((v): v is string => typeof v === 'string') : []
+  } catch { return [] }
 }
 const loadMaxRuntime = (): number => {
   const v = Number(localStorage.getItem(MAXRT_KEY))
@@ -60,6 +62,8 @@ const loadMaxRuntime = (): number => {
 
 type RecipeTab = 'view' | 'edit'
 type SecretEntry = { key: string; value: string }
+type TreeEntry = { kind: 'folder'; path: string; name: string; level: number } | { kind: 'recipe'; recipe: Recipe; level: number }
+const isLocalServer = (server: Pick<Server, 'name'>) => server.name.trim().toLowerCase() === 'local'
 
 type Modal =
   | { kind: 'server-form'; draft: Partial<Server> }
@@ -68,65 +72,132 @@ type Modal =
 
 const RUNS_REFRESH_MS = 10_000
 
+function buildTree(recipes: Recipe[], folders: string[], collapsed: Set<string>): TreeEntry[] {
+  const paths = new Set(folders)
+  for (const recipe of recipes) {
+    const parts = recipe.name.split('/')
+    for (let i = 1; i < parts.length; i += 1) paths.add(parts.slice(0, i).join('/'))
+  }
+  const result: TreeEntry[] = []
+  const visit = (parent: string, level: number) => {
+    const prefix = parent ? `${parent}/` : ''
+    const directFolders = [...paths].filter(path => path.startsWith(prefix) && !path.slice(prefix.length).includes('/')).sort()
+    for (const path of directFolders) {
+      result.push({ kind: 'folder', path, name: path.slice(prefix.length), level })
+      if (!collapsed.has(path)) visit(path, level + 1)
+    }
+    recipes.filter(recipe => recipe.name.startsWith(prefix) && !recipe.name.slice(prefix.length).includes('/')).sort((a, b) => a.name.localeCompare(b.name)).forEach(recipe => result.push({ kind: 'recipe', recipe, level }))
+  }
+  visit('', 0)
+  return result
+}
+
 function App() {
   const servers = useAppSelector(s => s.servers)
   const recipes = useAppSelector(s => s.recipes)
+  const folders = useAppSelector(s => s.folders)
   const runs = useAppSelector(s => s.runs)
   const loaded = useAppSelector(s => s.loaded)
   const live = useAppSelector(s => s.live)
   const [railTab, setRailTab] = createSignal<'recipes' | 'servers'>('recipes')
-  const [selectedRecipeID, setSelectedRecipeID] = createSignal<number | null>(null)
+  const [selectedRecipe, setSelectedRecipe] = createSignal<string | null>(null)
   const [selectedServerID, setSelectedServerID] = createSignal<number | null>(null)
   const [recipeTab, setRecipeTab] = createSignal<RecipeTab>('view')
   const [newRecipeDraft, setNewRecipeDraft] = createSignal(false)
+  const [draftName, setDraftName] = createSignal('')
+  const [collapsedFolders, setCollapsedFolders] = createSignal<string[]>((() => {
+    try {
+      const saved: unknown = JSON.parse(localStorage.getItem('devbox.collapsed-recipe-folders') ?? '[]')
+      return Array.isArray(saved) ? saved.filter((path): path is string => typeof path === 'string') : []
+    } catch { return [] }
+  })())
+  const [folderDraft, setFolderDraft] = createSignal(false)
+  const [folderPath, setFolderPath] = createSignal('')
+  const [folderError, setFolderError] = createSignal('')
+  const [dropTarget, setDropTarget] = createSignal<string | null>(null)
   const [runContexts, setRunContexts] = createSignal<string[]>(loadRunContexts())
   const [maxRuntime, setMaxRuntime] = createSignal<number>(loadMaxRuntime())
   const [notice, setNotice] = createSignal('')
   const [error, setError] = createSignal('')
   const [modal, setModal] = createSignal<Modal | null>(null)
 
-  const recipesByID = createMemo(() => new Map(recipes().map(r => [r.id, r])))
+  const recipesByName = createMemo(() => new Map(recipes().map(r => [r.name, r])))
   const serversByID = createMemo(() => new Map(servers().map(s => [s.id, s])))
   const sortedRuns = createMemo(() => [...runs()].sort((a, b) => b.started_at.localeCompare(a.started_at)))
-  const selectedRecipe = createMemo(() => recipes().find(r => r.id === selectedRecipeID()) ?? null)
+  const currentRecipe = createMemo(() => (selectedRecipe() ? recipesByName().get(selectedRecipe()!) ?? null : null))
+  const treeEntries = createMemo(() => buildTree(recipes(), folders(), new Set(collapsedFolders())))
   const selectedServer = createMemo(() => servers().find(s => s.id === selectedServerID()) ?? null)
 
   // Persist checked execution contexts; drop ids that no longer exist in the inventory.
   createEffect(() => localStorage.setItem(CONTEXTS_KEY, JSON.stringify(runContexts())))
   createEffect(() => {
     if (!loaded()) return
-    const known = new Set([LOCAL_CONTEXT, ...servers().map(s => String(s.id))])
+    const known = new Set(servers().map(s => String(s.id)))
     const pruned = runContexts().filter(id => known.has(id))
-    if (pruned.length !== runContexts().length) setRunContexts(pruned)
+    if (pruned.length !== runContexts().length) {
+      setRunContexts(pruned)
+    } else if (pruned.length === 0) {
+      const local = servers().find(isLocalServer)
+      if (local) setRunContexts([String(local.id)])
+    }
   })
   const toggleRunContext = (id: string) =>
     setRunContexts(ids => ids.includes(id) ? ids.filter(x => x !== id) : [...ids, id])
   // Persist the per-run time limit chosen on the View tab.
   createEffect(() => localStorage.setItem(MAXRT_KEY, String(maxRuntime())))
+  createEffect(() => localStorage.setItem('devbox.collapsed-recipe-folders', JSON.stringify(collapsedFolders())))
 
-  const startNewRecipe = () => {
-    setSelectedRecipeID(null)
+  const startNewRecipe = (prefix = '') => {
+    setDraftName(prefix)
+    setSelectedRecipe(null)
     setSelectedServerID(null)
     setNewRecipeDraft(true)
     setRailTab('recipes')
     setRecipeTab('edit')
   }
-  const selectRecipe = (id: number) => {
+  const selectRecipe = (name: string) => {
     setNewRecipeDraft(false)
     setSelectedServerID(null)
-    setSelectedRecipeID(id)
+    setSelectedRecipe(name)
     setRecipeTab('view')
   }
-  const openRecipeEdit = (id: number) => {
+  const openRecipeEdit = (name: string) => {
     setNewRecipeDraft(false)
     setSelectedServerID(null)
-    setSelectedRecipeID(id)
+    setSelectedRecipe(name)
     setRailTab('recipes')
     setRecipeTab('edit')
   }
   const cancelRecipeEdit = () => {
     setNewRecipeDraft(false)
     setRecipeTab('view')
+  }
+  const toggleFolder = (path: string) => setCollapsedFolders(paths => paths.includes(path) ? paths.filter(p => p !== path) : [...paths, path])
+  const validateFolder = (raw: string) => {
+    const path = raw.trim().replace(/^\/+|\/+$/g, '')
+    if (!path) return 'Enter a folder path.'
+    if (path.split('/').some(segment => !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(segment) || segment.startsWith('_'))) return 'Use slash-separated names starting with a letter or digit; underscore-prefixed segments are reserved.'
+    return ''
+  }
+  const createFolder = async () => {
+    const path = folderPath().trim().replace(/^\/+|\/+$/g, '')
+    const problem = validateFolder(path)
+    if (problem) { setFolderError(problem); return }
+    try {
+      await store.createRecipeFolder(path)
+      setFolderPath(''); setFolderError(''); setFolderDraft(false)
+      await reload(); message(`Folder “${path}” created.`)
+    } catch (e) { setFolderError(e instanceof Error ? e.message : 'Could not create folder.') }
+  }
+  const moveRecipe = async (recipe: Recipe, folder: string) => {
+    const base = recipe.name.slice(recipe.name.lastIndexOf('/') + 1)
+    const name = folder ? `${folder}/${base}` : base
+    if (name === recipe.name) return
+    try {
+      await api(`/recipes/${encodeURIComponent(recipe.name)}`, { method: 'PUT', body: JSON.stringify({ name, content: recipe.content }) })
+      if (selectedRecipe() === recipe.name) setSelectedRecipe(name)
+      await reload(); message(`Moved “${base}”.`)
+    } catch (e) { fail(e) }
   }
 
   let noticeTimer: number | undefined
@@ -165,19 +236,23 @@ function App() {
       message('Server secrets saved.')
     } catch (e) { fail(e); throw e }
   }
-  async function saveRecipe(draft: { id?: number; name: string; content: string }) {
+  async function saveRecipe(draft: { name?: string; content: string }) {
     try {
-      if (draft.id) {
-        await api(`/recipes/${draft.id}`, { method: 'PUT', body: JSON.stringify({ name: draft.name, content: draft.content }) })
-        setSelectedRecipeID(draft.id)
+      const selected = selectedRecipe()
+      if (selected) {
+        const original = recipesByName().get(selected)
+        if (!original) throw new Error('Recipe no longer exists — reload.')
+        const name = draft.name?.trim() || original.name
+        await api(`/recipes/${encodeURIComponent(original.name)}`, { method: 'PUT', body: JSON.stringify({ name, content: draft.content }) })
+        setSelectedRecipe(name)
       } else {
-        const created = await api<Recipe>('/recipes', { method: 'POST', body: JSON.stringify({ name: draft.name, content: draft.content }) })
-        setSelectedRecipeID(created.id)
+        const created = await api<Recipe>('/recipes', { method: 'POST', body: JSON.stringify({ name: draft.name ?? '', content: draft.content }) })
+        setSelectedRecipe(created.name)
       }
       setNewRecipeDraft(false)
       await reload()
       setRecipeTab('view')
-      message(draft.id ? 'Recipe updated.' : 'Recipe saved.')
+      message(selected ? 'Recipe updated.' : 'Recipe saved.')
     } catch (e) { fail(e) }
   }
   function confirmDelete(title: string, body: string, label: string, action: () => Promise<void>) {
@@ -188,30 +263,30 @@ function App() {
       try { await api(`/servers/${id}`, { method: 'DELETE' }); setModal(null); if (selectedServerID() === id) setSelectedServerID(null); await reload(); message('Server deleted.') } catch (e) { fail(e) }
     })
   }
-  async function removeRecipe(id: number) {
-    confirmDelete('Delete recipe', `Delete “${recipesByID().get(id)?.name ?? 'this recipe'}”? Its execution history will remain in the dock's source data until purged separately.`, 'Delete recipe', async () => {
+  async function removeRecipe(name: string) {
+    confirmDelete('Delete recipe', `Delete “${recipesByName().get(name)?.name ?? name}”? Its execution history will remain in the dock's source data until purged separately.`, 'Delete recipe', async () => {
       try {
-        await api(`/recipes/${id}`, { method: 'DELETE' })
+        await api(`/recipes/${encodeURIComponent(name)}`, { method: 'DELETE' })
         setModal(null)
-        if (selectedRecipeID() === id) { setSelectedRecipeID(null); setRecipeTab('view') }
+        if (selectedRecipe() === name) { setSelectedRecipe(null); setRecipeTab('view') }
         await reload(); message('Recipe deleted.')
       } catch (e) { fail(e) }
     })
   }
-  async function runRecipe(recipeID: number) {
+  async function runRecipe(recipeName: string) {
     try {
-      const known = new Set([LOCAL_CONTEXT, ...servers().map(s => String(s.id))])
+      const known = new Set(servers().map(s => String(s.id)))
       const targets = runContexts().filter(id => known.has(id))
-      const queue = targets.length ? targets : [LOCAL_CONTEXT]
+      if (targets.length === 0) throw new Error('Choose at least one execution context.')
+      const queue = targets
       message(queue.length > 1 ? `${queue.length} runs started — watch the dock below.` : 'Run started — watch the dock below.')
       await Promise.all(queue.map(async id => {
-        const body: Record<string, number> = {}
-        if (id !== LOCAL_CONTEXT) body.server_id = Number(id)
+        const body: Record<string, unknown> = { recipe: recipeName, server_id: Number(id) }
         if (maxRuntime() > 0) body.max_runtime = maxRuntime()
         // The POST resolves when the run finishes; live progress arrives over
         // the /api/events stream. Upsert guards against a missed SSE frame.
         try {
-          store.upsertRun(await api<Run>(`/recipes/${recipeID}/run`, { method: 'POST', body: JSON.stringify(body) }))
+          store.upsertRun(await api<Run>('/runs', { method: 'POST', body: JSON.stringify(body) }))
         } catch (e) { fail(e) }
       }))
     } catch (e) { fail(e) }
@@ -258,7 +333,7 @@ function App() {
             <Show when={railTab() === 'recipes'} fallback={
               <button class="btn ghost sm" onClick={() => setModal({ kind: 'server-form', draft: { port: 22 } })}><Icon d={icons.pencil} /> New</button>
             }>
-              <button class="btn ghost sm" onClick={startNewRecipe}><Icon d={icons.pencil} /> New</button>
+              <div class="recipe-create-actions"><button class="btn ghost sm" onClick={() => startNewRecipe()}><Icon d={icons.pencil} /> New</button><button class="btn ghost sm icon-only" title="New folder" onClick={() => { setFolderDraft(true); setFolderError('') }}><Icon d={icons.folder} /></button></div>
             </Show>
           </div>
           <div class="rail-list">
@@ -268,31 +343,39 @@ function App() {
                   <article classList={{ row: true, selected: selectedServerID() === item.id }} onClick={() => { setSelectedServerID(item.id); setRailTab('servers') }}>
                     <div class="row-main">
                       <strong>{item.name}</strong>
-                      <small>{item.username}@{item.host}:{item.port}</small>
+                      <small>{isLocalServer(item) ? 'This Debian host · native Bun' : `${item.username}@${item.host}:${item.port}`}</small>
                     </div>
-                    <div class="row-actions">
+                    <Show when={!isLocalServer(item)}><div class="row-actions">
                       <button class="chip" title="Edit server" onClick={e => { e.stopPropagation(); setModal({ kind: 'server-form', draft: item }) }}><Icon d={icons.pencil} /></button>
                       <button class="chip danger-chip" title="Delete server" onClick={e => { e.stopPropagation(); removeServer(item.id) }}><Icon d={icons.trash} /></button>
-                    </div>
+                    </div></Show>
                   </article>
                 )}
               </For>
             }>
-              <For each={recipes()} fallback={<p class="empty">No recipes yet.<button class="btn ghost" onClick={startNewRecipe}>Write your first Bun shell recipe</button></p>}>
-                {item => (
-                  <article classList={{ row: true, selected: !newRecipeDraft() && selectedRecipeID() === item.id }} onClick={() => selectRecipe(item.id)}>
-                    <div class="row-main">
-                      <strong>{item.name}</strong>
-                      <small>updated {fmtFull(item.updated_at)}</small>
+              <div classList={{ 'recipe-tree': true, 'root-drop-target': dropTarget() === '' }} onDragOver={e => { e.preventDefault(); setDropTarget('') }} onDragLeave={() => setDropTarget(null)} onDrop={e => { e.preventDefault(); const name = e.dataTransfer?.getData('text/plain'); const recipe = name ? recipesByName().get(name) : undefined; if (recipe) void moveRecipe(recipe, ''); setDropTarget(null) }}>
+                <Show when={folderDraft()}>
+                  <form class="folder-draft" onSubmit={e => { e.preventDefault(); void createFolder() }}>
+                    <Icon d={icons.folder} /><input autofocus value={folderPath()} onInput={e => { setFolderPath(e.currentTarget.value); setFolderError('') }} placeholder="folder/path" aria-label="New folder path" />
+                    <button class="chip" type="submit" title="Create folder"><Icon d={icons.check} /></button>
+                    <button class="chip" type="button" title="Cancel" onClick={() => { setFolderDraft(false); setFolderError('') }}><Icon d={icons.x} /></button>
+                    <Show when={folderError()}><small>{folderError()}</small></Show>
+                  </form>
+                </Show>
+                <For each={treeEntries()} fallback={<p class="empty">No recipes yet.<button class="btn ghost" onClick={() => startNewRecipe()}>Write your first Bun shell recipe</button></p>}>
+                  {entry => entry.kind === 'folder' ? (
+                    <div classList={{ 'tree-folder': true, 'drop-target': dropTarget() === entry.path }} style={{ 'padding-left': `${5 + entry.level * 17}px` }}  onDragOver={e => { e.preventDefault(); setDropTarget(entry.path) }} onDragLeave={() => setDropTarget(null)} onDrop={e => { e.preventDefault(); const name = e.dataTransfer?.getData('text/plain'); const recipe = name ? recipesByName().get(name) : undefined; if (recipe) void moveRecipe(recipe, entry.path); setDropTarget(null) }}>
+                      <button class="folder-toggle" aria-expanded={!collapsedFolders().includes(entry.path)} onClick={() => toggleFolder(entry.path)}><span classList={{ chevron: true, collapsed: collapsedFolders().includes(entry.path) }}><Icon d={icons.chevron} size={14} /></span><Icon d={icons.folder} size={15} /><strong>{entry.name}</strong></button>
+                      <button class="chip folder-add" title={`New recipe in ${entry.path}`} onClick={() => startNewRecipe(`${entry.path}/`)}><Icon d={icons.plus} /></button>
                     </div>
-                    <div class="row-actions">
-                      <button class="chip run-chip" title={`Run ${item.name}`} onClick={e => { e.stopPropagation(); runRecipe(item.id) }}><Icon d={icons.play} /></button>
-                      <button class="chip" title="Edit recipe" onClick={e => { e.stopPropagation(); openRecipeEdit(item.id) }}><Icon d={icons.pencil} /></button>
-                      <button class="chip danger-chip" title="Delete recipe" onClick={e => { e.stopPropagation(); removeRecipe(item.id) }}><Icon d={icons.trash} /></button>
-                    </div>
-                  </article>
-                )}
-              </For>
+                  ) : (
+                    <article draggable classList={{ row: true, 'tree-recipe': true, selected: !newRecipeDraft() && selectedRecipe() === entry.recipe.name }} style={{ 'padding-left': `${12 + entry.level * 17}px` }}  onDragStart={e => { e.dataTransfer?.setData('text/plain', entry.recipe.name); if (e.dataTransfer) e.dataTransfer.effectAllowed = 'move' }} onDragEnd={() => setDropTarget(null)} onClick={() => selectRecipe(entry.recipe.name)}>
+                      <div class="row-main"><strong>{entry.recipe.name.slice(entry.recipe.name.lastIndexOf('/') + 1)}</strong><small>updated {fmtFull(entry.recipe.updated_at)}</small></div>
+                      <div class="row-actions"><button class="chip run-chip" title={`Run ${entry.recipe.name}`} onClick={e => { e.stopPropagation(); runRecipe(entry.recipe.name) }}><Icon d={icons.play} /></button><button class="chip" title="Edit recipe" onClick={e => { e.stopPropagation(); openRecipeEdit(entry.recipe.name) }}><Icon d={icons.pencil} /></button><button class="chip danger-chip" title="Delete recipe" onClick={e => { e.stopPropagation(); removeRecipe(entry.recipe.name) }}><Icon d={icons.trash} /></button></div>
+                    </article>
+                  )}
+                </For>
+              </div>
             </Show>
           </div>
         </section>
@@ -304,35 +387,38 @@ function App() {
                 <>
                   <div class="detail-head">
                     <h2>{srv().name}</h2>
-                    <span class="tag">SSH inventory</span>
+                    <span class="tag">{isLocalServer(srv()) ? 'This machine' : 'SSH inventory'}</span>
                   </div>
-                  <p class="conn-string mono">{srv().username}@{srv().host}:{srv().port}</p>
+                  <p class="conn-string mono">{isLocalServer(srv()) ? 'Native Bun on this Debian host' : `${srv().username}@${srv().host}:${srv().port}`}</p>
                   <dl class="meta">
-                    <div><dt>Port</dt><dd class="mono">{srv().port}</dd></div>
-                    <div><dt>User</dt><dd>{srv().username}</dd></div>
+                    <Show when={!isLocalServer(srv())}>
+                      <div><dt>Port</dt><dd class="mono">{srv().port}</dd></div>
+                      <div><dt>User</dt><dd>{srv().username}</dd></div>
+                    </Show>
+                    <Show when={isLocalServer(srv())}><div><dt>Runtime</dt><dd>Direct Bun</dd></div></Show>
                     <div><dt>Added</dt><dd>{fmtFull(srv().created_at)}</dd></div>
                     <div><dt>Updated</dt><dd>{fmtFull(srv().updated_at)}</dd></div>
                   </dl>
-                  <p class="scope-note">Checked in a recipe's execution context, the recipe is streamed over SSH and run in a <code class="mono">nix-shell -p bun</code> on this server.</p>
-                  <div class="detail-actions">
+                  <p class="scope-note">{isLocalServer(srv()) ? <>Recipes run directly with <code class="mono">bun</code> on this Debian host. Add environment variables below; they are injected into every run here.</> : <>Checked in a recipe's execution context, the recipe is streamed over SSH and run in a <code class="mono">nix-shell -p bun</code> on this server.</>}</p>
+                  <Show when={!isLocalServer(srv())}><div class="detail-actions">
                     <button class="btn ghost" onClick={() => setModal({ kind: 'server-form', draft: srv() })}><Icon d={icons.pencil} /> Edit</button>
                     <button class="btn ghost danger" onClick={() => removeServer(srv().id)}><Icon d={icons.trash} /> Delete</button>
-                  </div>
+                  </div></Show>
                   <ServerSecrets server={srv()} onSave={saveServerSecrets} />
                 </>
               )}
             </Show>
           }>
             <Show when={newRecipeDraft()} fallback={
-              <Show when={selectedRecipe()} keyed fallback={<DetailHint kind="recipe" loaded={loaded()} onNew={startNewRecipe} />}>
+              <Show when={currentRecipe()} keyed fallback={<DetailHint kind="recipe" loaded={loaded()} onNew={startNewRecipe} />}>
                 {rec => (
                   <RecipeDetail
                     recipe={rec}
                     tab={recipeTab()}
                     onTab={setRecipeTab}
                     onSave={saveRecipe}
-                    onRun={() => runRecipe(rec.id)}
-                    onDelete={() => removeRecipe(rec.id)}
+                    onRun={() => runRecipe(rec.name)}
+                    onDelete={() => removeRecipe(rec.name)}
                     onCancelEdit={cancelRecipeEdit}
                     servers={servers()}
                     runContexts={runContexts()}
@@ -345,6 +431,7 @@ function App() {
             }>
               <RecipeDetail
                 recipe={null}
+                initialName={draftName()}
                 tab={recipeTab()}
                 onTab={setRecipeTab}
                 onSave={saveRecipe}
@@ -374,7 +461,7 @@ function App() {
             {run => (
               <button class="dock-row" onClick={() => setModal({ kind: 'run', id: run.id })}>
                 <span class={`status s-${run.status}`}>{statusLabel[run.status]}</span>
-                <span class="dock-name">{recipesByID().get(run.recipe_id)?.name ?? `Recipe #${run.recipe_id}`}</span>
+                <span class="dock-name">{recipesByName().get(run.recipe)?.name ?? run.recipe}</span>
                 <span class="dock-target">{runTarget(run)}</span>
                 <span class="dock-time mono">{fmtTime(run.started_at)}</span>
                 <span class="dock-dur mono">{fmtDuration(run)}</span>
@@ -400,9 +487,10 @@ function App() {
 
 function RecipeDetail(props: {
   recipe: Recipe | null
+  initialName?: string
   tab: RecipeTab
   onTab: (t: RecipeTab) => void
-  onSave: (d: { id?: number; name: string; content: string }) => Promise<void>
+  onSave: (d: { name?: string; content: string }) => Promise<void>
   onRun: (() => void) | null
   onDelete: (() => void) | null
   onCancelEdit: () => void
@@ -435,7 +523,7 @@ function RecipeDetail(props: {
         />
       </Show>
       <Show when={props.tab === 'edit'}>
-        <RecipeEditor recipe={props.recipe} onSave={props.onSave} onCancel={props.onCancelEdit} />
+        <RecipeEditor recipe={props.recipe} initialName={props.initialName} onSave={props.onSave} onCancel={props.onCancelEdit} />
       </Show>
     </>
   )
@@ -472,7 +560,7 @@ function RecipeView(props: {
           }}
         />
       </label>
-      <p class="scope-note">Runs execute in a <code class="mono">nix-shell -p bun</code> — locally, or over SSH on each checked server; one run per checked context. Use <code class="mono">0</code> for no time limit.</p>
+      <p class="scope-note">The <code class="mono">local</code> server runs directly with Bun on this Debian host. Other checked servers run over SSH in <code class="mono">nix-shell -p bun</code>. Use <code class="mono">0</code> for no time limit.</p>
       <div class="detail-actions">
         <Show when={props.onRun}>
           <button class="btn primary" onClick={() => props.onRun!()}><Icon d={icons.play} /> Run now</button>
@@ -487,20 +575,23 @@ function RecipeView(props: {
 
 function RecipeEditor(props: {
   recipe: Recipe | null
-  onSave: (d: { id?: number; name: string; content: string }) => Promise<void>
+  initialName?: string
+  onSave: (d: { name?: string; content: string }) => Promise<void>
   onCancel: () => void
 }) {
-  const [name, setName] = createSignal(props.recipe?.name ?? '')
+  const [name, setName] = createSignal(props.recipe?.name ?? props.initialName ?? '')
   const [content, setContent] = createSignal(props.recipe?.content ?? bunStarter)
   const [busy, setBusy] = createSignal(false)
   const submit = () => {
     if (busy()) return
     setBusy(true)
-    props.onSave({ id: props.recipe?.id, name: name().trim(), content: content() }).finally(() => setBusy(false))
+    // Editing an existing recipe sends the (possibly renamed) path so the
+    // backend can move the file; creating sends only the new name.
+    props.onSave({ name: name().trim(), content: content() }).finally(() => setBusy(false))
   }
   return (
     <form class="recipe-form" onSubmit={e => { e.preventDefault(); submit() }}>
-      <label>Name
+      <label>Name <Show when={props.recipe}><span class="hint">— rename or change the path to move the recipe</span></Show>
         <input required value={name()} onInput={e => setName(e.currentTarget.value)} placeholder="Install nginx" />
       </label>
       <label>Recipe content — Bun shell script
@@ -558,14 +649,15 @@ function ModalFrame(props: { title: string; tag?: string; onClose: () => void; c
 
 function ServerForm(props: { draft: Partial<Server>; onSave: (d: Partial<Server>) => Promise<void>; onCancel: () => void }) {
   const [draft, setDraft] = createSignal<Partial<Server>>(props.draft)
+  const local = () => (draft().name ?? '').trim().toLowerCase() === 'local'
   return (
-    <ModalFrame title={draft().id ? 'Edit server' : 'New server'} tag="SSH inventory" onClose={props.onCancel}>
+    <ModalFrame title={draft().id ? 'Edit server' : 'New server'} tag={local() ? 'This machine' : 'SSH inventory'} onClose={props.onCancel}>
       <form onSubmit={e => { e.preventDefault(); props.onSave(draft()) }}>
-        <label>Name<input required value={draft().name ?? ''} onInput={e => setDraft({ ...draft(), name: e.currentTarget.value })} placeholder="Production Web 01" /></label>
-        <label>IP or hostname<input required value={draft().host ?? ''} onInput={e => setDraft({ ...draft(), host: e.currentTarget.value })} placeholder="web-01.example.internal" /></label>
+        <label>Name<input required value={draft().name ?? ''} onInput={e => { const name = e.currentTarget.value; setDraft(name.trim().toLowerCase() === 'local' ? { ...draft(), name, host: '', port: 0, username: '' } : { ...draft(), name }) }} placeholder="Production Web 01" /></label>
+        <label>IP or hostname<input required={!local()} readOnly={local()} value={local() ? '' : draft().host ?? ''} onInput={e => setDraft({ ...draft(), host: e.currentTarget.value })} placeholder={local() ? 'Not used on this machine' : 'web-01.example.internal'} /></label>
         <div class="twocol">
-          <label>Port<input required type="number" min="1" max="65535" value={draft().port ?? 22} onInput={e => setDraft({ ...draft(), port: Number(e.currentTarget.value) })} /></label>
-          <label>Username<input required value={draft().username ?? ''} onInput={e => setDraft({ ...draft(), username: e.currentTarget.value })} placeholder="deploy" /></label>
+          <label>Port<input required={!local()} readOnly={local()} type="number" min="1" max="65535" value={local() ? '' : draft().port ?? 22} onInput={e => setDraft({ ...draft(), port: Number(e.currentTarget.value) })} placeholder={local() ? 'Not used' : undefined} /></label>
+          <label>Username<input required={!local()} readOnly={local()} value={local() ? '' : draft().username ?? ''} onInput={e => setDraft({ ...draft(), username: e.currentTarget.value })} placeholder={local() ? 'Not used on this machine' : 'deploy'} /></label>
         </div>
         <div class="dialog-actions">
           <button type="button" class="btn ghost" onClick={props.onCancel}>Cancel</button>
@@ -642,8 +734,7 @@ function ContextMultiSelect(props: { servers: Server[]; selected: string[]; onTo
   }
   return (
     <div class="ms-list" role="group" aria-label="Execution context">
-      <Option id={LOCAL_CONTEXT} title="Local runner" sub="nix-shell -p bun on this machine" />
-      <For each={props.servers}>{s => <Option id={String(s.id)} title={s.name} sub={`${s.username}@${s.host}:${s.port}`} />}</For>
+      <For each={props.servers}>{s => <Option id={String(s.id)} title={s.name} sub={isLocalServer(s) ? 'Native Bun on this Debian host' : `${s.username}@${s.host}:${s.port}`} />}</For>
     </div>
   )
 }

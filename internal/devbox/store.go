@@ -10,10 +10,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -49,17 +51,19 @@ type Server struct {
 	UpdatedAt time.Time         `json:"updated_at" yaml:"updated_at"`
 }
 
+// Recipe is identified by its slash path relative to data/recipes without
+// the .ts extension (for example "web/tools/deploy"). Timestamps come from
+// the file mtime — the store keeps no separate index.
 type Recipe struct {
-	ID        int64     `json:"id" yaml:"id"`
-	Name      string    `json:"name" yaml:"name"`
-	Content   string    `json:"content" yaml:"-"`
-	CreatedAt time.Time `json:"created_at" yaml:"created_at"`
-	UpdatedAt time.Time `json:"updated_at" yaml:"updated_at"`
+	Name      string    `json:"name"`
+	Content   string    `json:"content"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 type Run struct {
 	ID         int64      `json:"id"`
-	RecipeID   int64      `json:"recipe_id"`
+	Recipe     string     `json:"recipe"`
 	ServerID   *int64     `json:"server_id,omitempty"`
 	Status     string     `json:"status"`
 	StartedAt  time.Time  `json:"started_at"`
@@ -73,20 +77,14 @@ type hostsFile struct {
 	Items  []Server `yaml:"hosts"`
 }
 
-type recipesIndex struct {
-	NextID int64        `yaml:"next_id"`
-	Items  []recipeMeta `yaml:"recipes"`
-}
-
-type recipeMeta struct {
-	ID        int64     `yaml:"id"`
-	Name      string    `yaml:"name"`
-	CreatedAt time.Time `yaml:"created_at"`
-	UpdatedAt time.Time `yaml:"updated_at"`
-}
-
-var safeName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
+var safeSegment = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
 var safeEnvKey = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+
+const localServerName = "local"
+
+func isLocalServer(v Server) bool {
+	return strings.EqualFold(strings.TrimSpace(v.Name), localServerName)
+}
 
 func Open(ctx context.Context, root string) (*Store, error) {
 	if root == "" {
@@ -100,6 +98,9 @@ func Open(ctx context.Context, root string) (*Store, error) {
 	if err := s.ensureLayout(); err != nil {
 		return nil, err
 	}
+	if err := s.ensureLocalServer(); err != nil {
+		return nil, err
+	}
 	return s, nil
 }
 
@@ -107,13 +108,23 @@ func (s *Store) Close() error { return nil }
 
 func (s *Store) hostsPath() string  { return filepath.Join(s.Root, "hosts.yml") }
 func (s *Store) recipesDir() string { return filepath.Join(s.Root, "recipes") }
+
+// helpersDir holds shared helper scripts prepended to every run. The leading
+// underscore keeps it out of the recipe scan.
+func (s *Store) helpersDir() string { return filepath.Join(s.recipesDir(), "_helpers") }
+
+// recipesIndexPath is the retired recipes.yml index, kept only so Open can
+// migrate legacy data dirs away from it.
 func (s *Store) recipesIndexPath() string {
 	return filepath.Join(s.Root, "recipes.yml")
 }
 func (s *Store) logsDir() string { return filepath.Join(s.Root, "logs") }
 func (s *Store) recipePath(name string) string {
-	return filepath.Join(s.recipesDir(), name+".ts")
+	return filepath.Join(s.recipesDir(), filepath.FromSlash(name)+".ts")
 }
+
+// recipeGitPath is the recipe location relative to the data git root.
+func (s *Store) recipeGitPath(name string) string { return "recipes/" + name + ".ts" }
 
 func (s *Store) ensureLayout() error {
 	for _, dir := range []string{s.Root, s.recipesDir(), s.logsDir()} {
@@ -132,12 +143,35 @@ func (s *Store) ensureLayout() error {
 			return err
 		}
 	}
-	if _, err := os.Stat(s.recipesIndexPath()); err != nil {
-		if err := s.writeRecipesIndex(recipesIndex{NextID: 1, Items: []recipeMeta{}}); err != nil {
-			return err
-		}
+	if err := s.dropLegacyIndex(); err != nil {
+		return err
 	}
 	return s.ensureGit()
+}
+
+// dropLegacyIndex removes the retired recipes.yml id index (recipes are now
+// identified by their path). Legacy run logs reference numeric recipe ids
+// that no longer resolve, so they are cleared as well. Idempotent: fresh and
+// already-migrated stores hit the os.Stat miss and return immediately.
+func (s *Store) dropLegacyIndex() error {
+	if _, err := os.Stat(s.recipesIndexPath()); err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	entries, err := os.ReadDir(s.logsDir())
+	if err == nil {
+		for _, e := range entries {
+			if !e.IsDir() && strings.HasSuffix(e.Name(), ".json") {
+				_ = os.Remove(filepath.Join(s.logsDir(), e.Name()))
+			}
+		}
+	}
+	if err := os.Remove(s.recipesIndexPath()); err != nil {
+		return err
+	}
+	return s.commit("dropped recipes.yml index and legacy run logs", "recipes.yml")
 }
 
 func (s *Store) ensureGit() error {
@@ -157,12 +191,45 @@ func (s *Store) ensureGit() error {
 			return err
 		}
 	}
-	if err := s.git("add", "--", "hosts.yml", "recipes.yml", "recipes", ".gitignore", "logs/.gitignore"); err != nil {
+	if err := s.git("add", "--", "hosts.yml", "recipes", ".gitignore", "logs/.gitignore"); err != nil {
 		return err
 	}
 	// Initial commit may be empty-ish on first boot after files exist.
 	_ = s.git("commit", "-m", "initial data layout")
 	return nil
+}
+
+// ensureLocalServer reserves the first inventory entry for the host running
+// devbox-manager. It has no SSH address because recipes run locally with Bun.
+func (s *Store) ensureLocalServer() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	f, err := s.readHosts()
+	if err != nil {
+		return err
+	}
+	for i := range f.Items {
+		if !isLocalServer(f.Items[i]) {
+			continue
+		}
+		local := &f.Items[i]
+		if local.Name == localServerName && local.Host == "" && local.Port == 0 && local.Username == "" {
+			return nil
+		}
+		local.Name, local.Host, local.Port, local.Username = localServerName, "", 0, ""
+		local.UpdatedAt = time.Now().UTC()
+		if err := s.writeHosts(f); err != nil {
+			return err
+		}
+		return s.commit("normalized local host", "hosts.yml")
+	}
+	now := time.Now().UTC()
+	f.Items = append(f.Items, Server{ID: f.NextID, Name: localServerName, CreatedAt: now, UpdatedAt: now})
+	f.NextID++
+	if err := s.writeHosts(f); err != nil {
+		return err
+	}
+	return s.commit("added local host", "hosts.yml")
 }
 
 func (s *Store) git(args ...string) error {
@@ -227,51 +294,22 @@ func (s *Store) writeHosts(f hostsFile) error {
 	return os.WriteFile(s.hostsPath(), b, 0o644)
 }
 
-func (s *Store) readRecipesIndex() (recipesIndex, error) {
-	b, err := os.ReadFile(s.recipesIndexPath())
-	if err != nil {
-		return recipesIndex{}, err
-	}
-	var f recipesIndex
-	if err := yaml.Unmarshal(b, &f); err != nil {
-		return recipesIndex{}, err
-	}
-	if f.Items == nil {
-		f.Items = []recipeMeta{}
-	}
-	if f.NextID < 1 {
-		f.NextID = 1
-		for _, r := range f.Items {
-			if r.ID >= f.NextID {
-				f.NextID = r.ID + 1
-			}
-		}
-	}
-	return f, nil
-}
-
-func (s *Store) writeRecipesIndex(f recipesIndex) error {
-	if f.Items == nil {
-		f.Items = []recipeMeta{}
-	}
-	b, err := yaml.Marshal(&f)
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(s.recipesIndexPath(), b, 0o644)
-}
-
 func cleanServer(v Server) (Server, error) {
 	v.Name = strings.TrimSpace(v.Name)
 	v.Host = strings.TrimSpace(v.Host)
 	v.Username = strings.TrimSpace(v.Username)
-	if v.Name == "" || v.Host == "" || v.Username == "" {
+	if v.Name == "" {
+		return v, errors.New("name is required")
+	}
+	if isLocalServer(v) {
+		v.Name, v.Host, v.Port, v.Username = localServerName, "", 0, ""
+	} else if v.Host == "" || v.Username == "" {
 		return v, errors.New("name, host, and username are required")
 	}
-	if v.Port == 0 {
+	if !isLocalServer(v) && v.Port == 0 {
 		v.Port = 22
 	}
-	if v.Port < 1 || v.Port > 65535 {
+	if !isLocalServer(v) && (v.Port < 1 || v.Port > 65535) {
 		return v, errors.New("port must be between 1 and 65535")
 	}
 	if len(v.Secrets) == 0 {
@@ -291,14 +329,38 @@ func cleanServer(v Server) (Server, error) {
 }
 
 func cleanRecipe(v Recipe) (Recipe, error) {
-	v.Name = strings.TrimSpace(v.Name)
-	if v.Name == "" || v.Content == "" {
-		return v, errors.New("name and content are required")
+	name, err := validateRecipeName(v.Name)
+	if err != nil {
+		return v, err
 	}
-	if !safeName.MatchString(v.Name) {
-		return v, errors.New("name must match [A-Za-z0-9][A-Za-z0-9._-]*")
+	v.Name = name
+	if v.Content == "" {
+		return v, errors.New("content is required")
 	}
 	return v, nil
+}
+
+// validateRecipeName normalizes and validates a recipe or folder path: each
+// slash-separated segment must match [A-Za-z0-9][A-Za-z0-9._-]* and may not
+// start with an underscore (that prefix is reserved, e.g. recipes/_helpers).
+func validateRecipeName(name string) (string, error) {
+	name = strings.TrimSpace(name)
+	name = strings.Trim(name, "/")
+	if name == "" {
+		return "", errors.New("name is required")
+	}
+	if len(name) > 256 {
+		return "", errors.New("name is too long")
+	}
+	for _, seg := range strings.Split(name, "/") {
+		if !safeSegment.MatchString(seg) {
+			return "", fmt.Errorf("path segment %q must match [A-Za-z0-9][A-Za-z0-9._-]*", seg)
+		}
+		if strings.HasPrefix(seg, "_") {
+			return "", fmt.Errorf("path segment %q may not start with an underscore", seg)
+		}
+	}
+	return name, nil
 }
 
 func (s *Store) ListServers(ctx context.Context) ([]Server, error) {
@@ -309,7 +371,12 @@ func (s *Store) ListServers(ctx context.Context) ([]Server, error) {
 		return nil, err
 	}
 	out := append([]Server(nil), f.Items...)
-	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	sort.Slice(out, func(i, j int) bool {
+		if isLocalServer(out[i]) != isLocalServer(out[j]) {
+			return isLocalServer(out[i])
+		}
+		return out[i].Name < out[j].Name
+	})
 	return out, nil
 }
 
@@ -386,6 +453,9 @@ func (s *Store) UpdateServer(ctx context.Context, id int64, v Server) (Server, e
 		return v, ErrNotFound
 	}
 	prev := f.Items[idx]
+	if isLocalServer(prev) && !isLocalServer(v) {
+		return v, errors.New("the local host name is reserved")
+	}
 	v.ID = id
 	v.CreatedAt = prev.CreatedAt
 	v.UpdatedAt = time.Now().UTC()
@@ -418,6 +488,9 @@ func (s *Store) DeleteServer(ctx context.Context, id int64) error {
 	if idx < 0 {
 		return ErrNotFound
 	}
+	if isLocalServer(f.Items[idx]) {
+		return errors.New("the local host cannot be deleted")
+	}
 	f.Items = append(f.Items[:idx], f.Items[idx+1:]...)
 	if err := s.writeHosts(f); err != nil {
 		return err
@@ -425,47 +498,108 @@ func (s *Store) DeleteServer(ctx context.Context, id int64) error {
 	return s.commit(fmt.Sprintf("removed %s host", name), "hosts.yml")
 }
 
-func (s *Store) ListRecipes(ctx context.Context) ([]Recipe, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	idx, err := s.readRecipesIndex()
+// scanRecipesLocked walks data/recipes collecting *.ts files as recipes.
+// Directories starting with "_" (helpers) and non-.ts files (e.g. .gitkeep)
+// are skipped; names are slash paths relative to recipesDir without the
+// extension. Timestamps come from the file mtime.
+func (s *Store) scanRecipesLocked() ([]Recipe, error) {
+	var out []Recipe
+	err := filepath.WalkDir(s.recipesDir(), func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			if path != s.recipesDir() && strings.HasPrefix(d.Name(), "_") {
+				return fs.SkipDir
+			}
+			return nil
+		}
+		if !strings.HasSuffix(d.Name(), ".ts") {
+			return nil
+		}
+		rel, err := filepath.Rel(s.recipesDir(), path)
+		if err != nil {
+			return err
+		}
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+		content, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		name := strings.TrimSuffix(filepath.ToSlash(rel), ".ts")
+		out = append(out, Recipe{Name: name, Content: string(content), CreatedAt: info.ModTime(), UpdatedAt: info.ModTime()})
+		return nil
+	})
 	if err != nil {
 		return nil, err
-	}
-	out := make([]Recipe, 0, len(idx.Items))
-	for _, m := range idx.Items {
-		content, err := os.ReadFile(s.recipePath(m.Name))
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, Recipe{ID: m.ID, Name: m.Name, Content: string(content), CreatedAt: m.CreatedAt, UpdatedAt: m.UpdatedAt})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out, nil
 }
 
-func (s *Store) GetRecipe(ctx context.Context, id int64) (Recipe, error) {
+func (s *Store) ListRecipes(ctx context.Context) ([]Recipe, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.getRecipeLocked(id)
+	return s.scanRecipesLocked()
 }
 
-func (s *Store) getRecipeLocked(id int64) (Recipe, error) {
-	idx, err := s.readRecipesIndex()
+// ListRecipeFolders returns slash-separated recipe directory paths. Helper
+// directories are implementation details and are never exposed to the UI.
+func (s *Store) ListRecipeFolders(ctx context.Context) ([]string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	folders := make([]string, 0)
+	err := filepath.WalkDir(s.recipesDir(), func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if !d.IsDir() || path == s.recipesDir() {
+			return nil
+		}
+		if strings.HasPrefix(d.Name(), "_") {
+			return fs.SkipDir
+		}
+		rel, err := filepath.Rel(s.recipesDir(), path)
+		if err != nil {
+			return err
+		}
+		folders = append(folders, filepath.ToSlash(rel))
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	sort.Strings(folders)
+	return folders, nil
+}
+
+func (s *Store) GetRecipe(ctx context.Context, name string) (Recipe, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.getRecipeLocked(name)
+}
+
+func (s *Store) getRecipeLocked(name string) (Recipe, error) {
+	name, err := validateRecipeName(name)
 	if err != nil {
 		return Recipe{}, err
 	}
-	for _, m := range idx.Items {
-		if m.ID != id {
-			continue
+	path := s.recipePath(name)
+	info, err := os.Stat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return Recipe{}, ErrNotFound
 		}
-		content, err := os.ReadFile(s.recipePath(m.Name))
-		if err != nil {
-			return Recipe{}, err
-		}
-		return Recipe{ID: m.ID, Name: m.Name, Content: string(content), CreatedAt: m.CreatedAt, UpdatedAt: m.UpdatedAt}, nil
+		return Recipe{}, err
 	}
-	return Recipe{}, ErrNotFound
+	content, err := os.ReadFile(path)
+	if err != nil {
+		return Recipe{}, err
+	}
+	return Recipe{Name: name, Content: string(content), CreatedAt: info.ModTime(), UpdatedAt: info.ModTime()}, nil
 }
 
 func (s *Store) CreateRecipe(ctx context.Context, v Recipe) (Recipe, error) {
@@ -475,116 +609,191 @@ func (s *Store) CreateRecipe(ctx context.Context, v Recipe) (Recipe, error) {
 	if err != nil {
 		return v, err
 	}
-	idx, err := s.readRecipesIndex()
-	if err != nil {
+	if _, err := os.Stat(s.recipePath(v.Name)); err == nil {
+		return v, errors.New("UNIQUE constraint failed: name already exists")
+	} else if !os.IsNotExist(err) {
 		return v, err
 	}
-	for _, m := range idx.Items {
-		if strings.EqualFold(m.Name, v.Name) {
-			return v, errors.New("UNIQUE constraint failed: name already exists")
-		}
+	if err := os.MkdirAll(filepath.Dir(s.recipePath(v.Name)), 0o755); err != nil {
+		return v, err
 	}
-	now := time.Now().UTC()
-	v.ID = idx.NextID
-	idx.NextID++
-	v.CreatedAt = now
-	v.UpdatedAt = now
 	if err := os.WriteFile(s.recipePath(v.Name), []byte(v.Content), 0o644); err != nil {
 		return v, err
 	}
-	idx.Items = append(idx.Items, recipeMeta{ID: v.ID, Name: v.Name, CreatedAt: v.CreatedAt, UpdatedAt: v.UpdatedAt})
-	if err := s.writeRecipesIndex(idx); err != nil {
+	if err := s.commit(fmt.Sprintf("added %s.ts recipe", v.Name), s.recipeGitPath(v.Name)); err != nil {
 		return v, err
 	}
-	if err := s.commit(fmt.Sprintf("added %s.ts recipe", v.Name), "recipes.yml", filepath.Join("recipes", v.Name+".ts")); err != nil {
-		return v, err
-	}
-	return v, nil
+	return s.getRecipeLocked(v.Name)
 }
 
-func (s *Store) UpdateRecipe(ctx context.Context, id int64, v Recipe) (Recipe, error) {
+// UpdateRecipe rewrites the recipe at name; a changed v.Name moves the file
+// (rename or drag-and-drop between folders).
+func (s *Store) UpdateRecipe(ctx context.Context, name string, v Recipe) (Recipe, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	v, err := cleanRecipe(v)
+	oldName, err := validateRecipeName(name)
 	if err != nil {
 		return v, err
 	}
-	idx, err := s.readRecipesIndex()
+	if _, err := s.getRecipeLocked(oldName); err != nil {
+		return v, err
+	}
+	if strings.TrimSpace(v.Name) == "" {
+		v.Name = oldName
+	}
+	v, err = cleanRecipe(v)
 	if err != nil {
 		return v, err
 	}
-	pos := -1
-	var prev recipeMeta
-	for i, m := range idx.Items {
-		if m.ID == id {
-			pos = i
-			prev = m
-		} else if strings.EqualFold(m.Name, v.Name) {
+	if v.Name != oldName {
+		if _, err := os.Stat(s.recipePath(v.Name)); err == nil {
 			return v, errors.New("UNIQUE constraint failed: name already exists")
+		} else if !os.IsNotExist(err) {
+			return v, err
 		}
-	}
-	if pos < 0 {
-		return v, ErrNotFound
-	}
-	oldPath := s.recipePath(prev.Name)
-	newPath := s.recipePath(v.Name)
-	if prev.Name != v.Name {
-		if err := os.Rename(oldPath, newPath); err != nil {
+		if err := os.MkdirAll(filepath.Dir(s.recipePath(v.Name)), 0o755); err != nil {
+			return v, err
+		}
+		if err := os.Rename(s.recipePath(oldName), s.recipePath(v.Name)); err != nil {
 			return v, err
 		}
 	}
-	if err := os.WriteFile(newPath, []byte(v.Content), 0o644); err != nil {
+	if err := os.WriteFile(s.recipePath(v.Name), []byte(v.Content), 0o644); err != nil {
 		return v, err
 	}
-	v.ID = id
-	v.CreatedAt = prev.CreatedAt
-	v.UpdatedAt = time.Now().UTC()
-	idx.Items[pos] = recipeMeta{ID: v.ID, Name: v.Name, CreatedAt: v.CreatedAt, UpdatedAt: v.UpdatedAt}
-	if err := s.writeRecipesIndex(idx); err != nil {
-		return v, err
-	}
-	paths := []string{"recipes.yml", filepath.Join("recipes", v.Name+".ts")}
-	if prev.Name != v.Name {
-		// Stage deletion of old path if rename left git tracking the old name.
-		_ = s.git("rm", "--cached", "--ignore-unmatch", filepath.Join("recipes", prev.Name+".ts"))
-		paths = append(paths, filepath.Join("recipes", prev.Name+".ts"))
+	paths := []string{s.recipeGitPath(v.Name)}
+	if v.Name != oldName {
+		paths = append(paths, s.recipeGitPath(oldName))
+		s.pruneEmptyDirs(filepath.Dir(s.recipePath(oldName)))
 	}
 	if err := s.commit(fmt.Sprintf("edited %s.ts recipe", v.Name), paths...); err != nil {
 		return v, err
 	}
-	return v, nil
+	return s.getRecipeLocked(v.Name)
 }
 
-func (s *Store) DeleteRecipe(ctx context.Context, id int64) error {
+func (s *Store) DeleteRecipe(ctx context.Context, name string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	idx, err := s.readRecipesIndex()
+	name, err := validateRecipeName(name)
 	if err != nil {
 		return err
 	}
-	pos := -1
-	var name string
-	for i, m := range idx.Items {
-		if m.ID == id {
-			pos = i
-			name = m.Name
-			break
+	if _, err := os.Stat(s.recipePath(name)); err != nil {
+		if os.IsNotExist(err) {
+			return ErrNotFound
 		}
-	}
-	if pos < 0 {
-		return ErrNotFound
-	}
-	_ = os.Remove(s.recipePath(name))
-	idx.Items = append(idx.Items[:pos], idx.Items[pos+1:]...)
-	if err := s.writeRecipesIndex(idx); err != nil {
 		return err
 	}
-	_ = s.git("rm", "--cached", "--ignore-unmatch", filepath.Join("recipes", name+".ts"))
-	return s.commit(fmt.Sprintf("removed %s.ts recipe", name), "recipes.yml", filepath.Join("recipes", name+".ts"))
+	if err := os.Remove(s.recipePath(name)); err != nil {
+		return err
+	}
+	s.pruneEmptyDirs(filepath.Dir(s.recipePath(name)))
+	return s.commit(fmt.Sprintf("removed %s.ts recipe", name), s.recipeGitPath(name))
+}
+
+// CreateRecipeFolder creates an (empty) recipe folder. Git cannot track
+// empty directories, so a .gitkeep marker keeps it in version control.
+func (s *Store) CreateRecipeFolder(ctx context.Context, path string) (string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	name, err := validateRecipeName(path)
+	if err != nil {
+		return "", err
+	}
+	dir := filepath.Join(s.recipesDir(), filepath.FromSlash(name))
+	if info, err := os.Stat(dir); err == nil {
+		if !info.IsDir() {
+			return "", errors.New("UNIQUE constraint failed: name already exists")
+		}
+		return name, nil // idempotent
+	} else if !os.IsNotExist(err) {
+		return "", err
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", err
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".gitkeep"), []byte(""), 0o644); err != nil {
+		return "", err
+	}
+	if err := s.commit(fmt.Sprintf("added %s folder", name), "recipes/"+name+"/.gitkeep"); err != nil {
+		return "", err
+	}
+	return name, nil
+}
+
+// pruneEmptyDirs removes empty recipe folders upwards from dir (stop at
+// recipes root). Folders with a .gitkeep marker are never considered empty.
+func (s *Store) pruneEmptyDirs(dir string) {
+	for dir != s.recipesDir() && strings.HasPrefix(dir, s.recipesDir()+string(os.PathSeparator)) {
+		entries, err := os.ReadDir(dir)
+		if err != nil || len(entries) > 0 {
+			return
+		}
+		if err := os.Remove(dir); err != nil {
+			return
+		}
+		dir = filepath.Dir(dir)
+	}
 }
 
 func (s *Store) runPath(id int64) string {
 	return filepath.Join(s.logsDir(), fmt.Sprintf("%d.json", id))
+}
+
+var bunImportLine = regexp.MustCompile(`^import\s+[^;]*\s+from\s+"bun"$`)
+
+// RecipeHelpers concatenates every data/recipes/_helpers/*.ts file (sorted by
+// name) into one prologue for recipe runs. Every helper file imports from
+// "bun" with its own local alias; those import lines are hoisted and
+// deduplicated so the concatenated script stays valid TypeScript.
+func (s *Store) RecipeHelpers() (string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	entries, err := os.ReadDir(s.helpersDir())
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", nil
+		}
+		return "", err
+	}
+	var names []string
+	for _, e := range entries {
+		if !e.IsDir() && strings.HasSuffix(e.Name(), ".ts") {
+			names = append(names, e.Name())
+		}
+	}
+	sort.Strings(names)
+	var imports []string
+	var bodies []string
+	for _, name := range names {
+		b, err := os.ReadFile(filepath.Join(s.helpersDir(), name))
+		if err != nil {
+			return "", err
+		}
+		var kept []string
+		for _, line := range strings.Split(string(b), "\n") {
+			trimmed := strings.TrimSpace(line)
+			if bunImportLine.MatchString(trimmed) {
+				if !slices.Contains(imports, trimmed) {
+					imports = append(imports, trimmed)
+				}
+				continue
+			}
+			kept = append(kept, line)
+		}
+		if text := strings.TrimSpace(strings.Join(kept, "\n")); text != "" {
+			bodies = append(bodies, text)
+		}
+	}
+	if len(bodies) == 0 {
+		return "", nil
+	}
+	prologue := strings.Join(imports, "\n")
+	if prologue != "" {
+		prologue += "\n\n"
+	}
+	return prologue + strings.Join(bodies, "\n\n") + "\n", nil
 }
 
 func (s *Store) nextRunIDLocked() (int64, error) {
@@ -616,10 +825,10 @@ func (s *Store) writeRunLocked(v Run) error {
 	return os.WriteFile(s.runPath(v.ID), append(b, '\n'), 0o644)
 }
 
-func (s *Store) CreateRun(ctx context.Context, recipeID int64, serverID *int64) (Run, error) {
+func (s *Store) CreateRun(ctx context.Context, recipe string, serverID *int64) (Run, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, err := s.getRecipeLocked(recipeID); err != nil {
+	if _, err := s.getRecipeLocked(recipe); err != nil {
 		return Run{}, err
 	}
 	if serverID != nil {
@@ -633,7 +842,7 @@ func (s *Store) CreateRun(ctx context.Context, recipeID int64, serverID *int64) 
 	}
 	v := Run{
 		ID:        id,
-		RecipeID:  recipeID,
+		Recipe:    recipe,
 		ServerID:  serverID,
 		Status:    "running",
 		StartedAt: time.Now().UTC(),
@@ -684,14 +893,14 @@ func (s *Store) getRunLocked(id int64) (Run, error) {
 	return v, nil
 }
 
-func (s *Store) ListRuns(ctx context.Context, recipeID int64) ([]Run, error) {
+func (s *Store) ListRuns(ctx context.Context, recipe string) ([]Run, error) {
 	all, err := s.ListRecentRuns(ctx, 500)
 	if err != nil {
 		return nil, err
 	}
 	out := make([]Run, 0)
 	for _, r := range all {
-		if r.RecipeID == recipeID {
+		if r.Recipe == recipe {
 			out = append(out, r)
 		}
 	}
