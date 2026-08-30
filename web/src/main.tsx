@@ -6,9 +6,54 @@
 
 import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show } from 'solid-js'
 import { render } from 'solid-js/web'
+import * as monaco from 'monaco-editor'
+import EditorWorker from 'monaco-editor/editor/editor.worker?worker'
+import TsWorker from 'monaco-editor/language/typescript/ts.worker?worker'
 import { connectEvents, store, useAppSelector } from './store'
 import type { Recipe, Run, Server } from './store'
 import './styles.css'
+
+// Monaco workers ship as bundled module workers (Vite `?worker`). The TypeScript
+// worker powers validation and autocomplete for Bun shell recipes; the base
+// editor worker covers every other part of the editor.
+;(globalThis as unknown as { MonacoEnvironment?: { getWorker(workerId: string, label: string): Worker } }).MonacoEnvironment = {
+  getWorker(_workerId, label) {
+    return label === 'typescript' || label === 'javascript' ? new TsWorker() : new EditorWorker()
+  },
+}
+
+monaco.editor.defineTheme('devbox-dark', {
+  base: 'vs-dark',
+  inherit: true,
+  rules: [
+    { token: 'comment', foreground: '5c6f82', fontStyle: 'italic' },
+    { token: 'keyword', foreground: '6fc1e8' },
+    { token: 'string', foreground: '8fd8a6' },
+    { token: 'number', foreground: 'e8b64c' },
+    { token: 'type', foreground: '6fc1e8' },
+    { token: 'identifier', foreground: 'ecf1fa' },
+    { token: 'delimiter', foreground: '9caaba' },
+  ],
+  colors: {
+    'editor.background': '#0b1018',
+    'editor.foreground': '#cfe0d6',
+    'editorLineNumber.foreground': '#3d4c5e',
+    'editorLineNumber.activeForeground': '#9cb0c4',
+    'editorCursor.foreground': '#45d19b',
+    'editor.selectionBackground': '#1c3d2f',
+    'editor.inactiveSelectionBackground': '#162a22',
+    'editor.lineHighlightBackground': '#121a25',
+    'editor.indentGuide.background1': '#1d2836',
+    'editor.indentGuide.activeBackground1': '#2f4052',
+    'editorBracketMatch.background': '#1c3d2f',
+    'editorBracketMatch.border': '#45d19b66',
+    'editorGutter.background': '#0b1018',
+    'minimap.background': '#0d121c',
+    'scrollbarSlider.background': '#2a394966',
+    'scrollbarSlider.hoverBackground': '#3a4c6066',
+    'scrollbarSlider.activeBackground': '#40546b88',
+  },
+})
 
 const bunStarter = `import { $ } from "bun"
 
@@ -659,17 +704,69 @@ function RecipeView(props: {
           }}
         />
       </label>
-      <p class="scope-note">The <code class="mono">local</code> server runs directly with Bun on this Debian host. Other checked servers run over SSH in <code class="mono">nix-shell -p bun</code>. Use <code class="mono">0</code> for no time limit.</p>
       <div class="detail-actions">
         <Show when={props.onRun}>
-          <button class="btn primary" onClick={() => props.onRun!()}><Icon d={icons.play} /> Run now</button>
+          <button class="btn primary sm" onClick={() => props.onRun!()}><Icon d={icons.play} /> Run now</button>
         </Show>
         <Show when={props.onDelete}>
-          <button class="btn ghost danger" onClick={() => props.onDelete!()}><Icon d={icons.trash} /> Delete</button>
+          <button class="btn ghost danger sm" onClick={() => props.onDelete!()}><Icon d={icons.trash} /> Delete</button>
         </Show>
       </div>
     </>
   )
+}
+
+function MonacoEditor(props: { value: string; readOnly: boolean; onChange: (value: string) => void }) {
+  let host!: HTMLDivElement
+  let editor: monaco.editor.IStandaloneCodeEditor | undefined
+  let programmatic = false
+
+  onMount(() => {
+    editor = monaco.editor.create(host, {
+      value: props.value,
+      language: 'typescript',
+      theme: 'devbox-dark',
+      readOnly: props.readOnly,
+      automaticLayout: true,
+      minimap: { enabled: true, side: 'right', renderCharacters: false, scale: 1, maxColumn: 100 },
+      fontFamily: '"DM Mono", ui-monospace, SFMono-Regular, Menlo, monospace',
+      fontSize: 13,
+      lineHeight: 20,
+      tabSize: 2,
+      insertSpaces: true,
+      wordWrap: 'off',
+      scrollBeyondLastLine: false,
+      smoothScrolling: true,
+      cursorBlinking: 'smooth',
+      cursorSmoothCaretAnimation: 'on',
+      renderLineHighlight: 'all',
+      lineNumbersMinChars: 3,
+      glyphMargin: false,
+      folding: true,
+      foldingHighlight: false,
+      padding: { top: 14, bottom: 14 },
+      scrollbar: { verticalScrollbarSize: 10, horizontalScrollbarSize: 10, useShadows: false },
+      overviewRulerBorder: false,
+      bracketPairColorization: { enabled: true },
+      guides: { bracketPairs: true, indentation: true, highlightActiveIndentation: true },
+      suggest: { preview: true },
+      stickyScroll: { enabled: false },
+    })
+    editor.onDidChangeModelContent(() => { if (!programmatic) props.onChange(editor!.getValue()) })
+  })
+
+  createEffect(() => editor?.updateOptions({ readOnly: props.readOnly }))
+  createEffect(() => {
+    if (editor && editor.getValue() !== props.value) {
+      programmatic = true
+      editor.setValue(props.value)
+      programmatic = false
+    }
+  })
+
+  onCleanup(() => { editor?.dispose(); editor = undefined })
+
+  return <div class="monaco-wrap" ref={el => { host = el }} />
 }
 
 function RecipeEditor(props: {
@@ -680,25 +777,54 @@ function RecipeEditor(props: {
 }) {
   const [name, setName] = createSignal(props.recipe?.name ?? props.initialName ?? '')
   const [content, setContent] = createSignal(props.recipe?.content ?? bunStarter)
+  // Opening an existing recipe shows it locked; the buffer stays read-only until
+  // the author presses Edit. Brand-new recipes start unlocked.
+  const [readOnly, setReadOnly] = createSignal(props.recipe !== null)
   const [busy, setBusy] = createSignal(false)
+
+  // Switching recipes (or a reload) reloads the buffer and re-arms the lock.
+  createEffect(() => {
+    setName(props.recipe?.name ?? props.initialName ?? '')
+    setContent(props.recipe?.content ?? bunStarter)
+    setReadOnly(props.recipe !== null)
+  })
+
   const submit = () => {
-    if (busy()) return
+    if (readOnly() || busy()) return
     setBusy(true)
-    // Editing an existing recipe sends the (possibly renamed) path so the
-    // backend can move the file; creating sends only the new name.
     props.onSave({ name: name().trim(), content: content() }).finally(() => setBusy(false))
   }
+
   return (
     <form class="recipe-form" onSubmit={e => { e.preventDefault(); submit() }}>
-      <label>Name <Show when={props.recipe}><span class="hint">— rename or change the path to move the recipe</span></Show>
-        <input required value={name()} onInput={e => setName(e.currentTarget.value)} placeholder="Install nginx" />
+      <label class="recipe-name">Name
+        <Show when={props.recipe}><span class="field-hint">rename or change the path to move the recipe</span></Show>
+        <input required readOnly={readOnly()} value={name()} onInput={e => setName(e.currentTarget.value)} placeholder="Install nginx" />
       </label>
-      <label>Recipe content — Bun shell script
-        <textarea class="mono" required spellcheck={false} rows={16} value={content()} onInput={e => setContent(e.currentTarget.value)} />
-      </label>
-      <div class="detail-actions">
-        <button type="submit" class="btn primary" disabled={busy()}>{busy() ? 'Saving…' : props.recipe ? 'Save changes' : 'Save recipe'}</button>
-        <button type="button" class="btn ghost" onClick={props.onCancel}>Cancel</button>
+
+      <div class="editor-frame">
+        <div class="editor-head">
+          <span class="editor-label">Recipe content — Bun shell script</span>
+          <span classList={{ 'editor-state': true, editing: !readOnly() }}>
+            <Show when={readOnly()} fallback="Editing — save to write the file">Read only</Show>
+          </span>
+        </div>
+        <MonacoEditor value={content()} readOnly={readOnly()} onChange={setContent} />
+        <div class="editor-bar">
+          <span class="editor-note">
+            <Show when={readOnly()} fallback="Changes are staged until you save.">
+              <Icon d={icons.eye} size={13} /> Locked to prevent accidental changes.
+            </Show>
+          </span>
+          <div class="editor-actions">
+            <button type="button" class="btn ghost sm" onClick={props.onCancel}>Cancel</button>
+            <Show when={readOnly()} fallback={
+              <button type="submit" class="btn primary sm" disabled={busy()}>{busy() ? 'Saving…' : props.recipe ? 'Save changes' : 'Save recipe'}</button>
+            }>
+              <button type="button" class="btn primary sm" onClick={() => setReadOnly(false)}><Icon d={icons.pencil} size={13} /> Edit</button>
+            </Show>
+          </div>
+        </div>
       </div>
     </form>
   )
