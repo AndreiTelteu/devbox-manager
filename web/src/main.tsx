@@ -60,6 +60,28 @@ const loadMaxRuntime = (): number => {
   return Number.isFinite(v) && v > 0 ? Math.min(86400, Math.floor(v)) : 0
 }
 
+// Split-pane geometry: rail width and executions-dock height, persisted in px.
+const SIZES_KEY = 'devbox.panel-sizes'
+type PanelSizes = { rail: number; dock: number }
+const DEFAULT_SIZES: PanelSizes = { rail: 380, dock: 216 }
+const RAIL_MIN = 264
+const DOCK_MIN = 128
+const railMax = () => Math.max(RAIL_MIN, window.innerWidth - 540)
+const dockMax = () => Math.max(DOCK_MIN, window.innerHeight - 400)
+const clampSize = (v: number, lo: number, hi: number) => Math.min(Math.max(v, lo), Math.max(lo, hi))
+const loadPanelSizes = (): PanelSizes => {
+  try {
+    const raw: unknown = JSON.parse(localStorage.getItem(SIZES_KEY) ?? '{}')
+    const rec = (raw && typeof raw === 'object' ? raw : {}) as Record<string, unknown>
+    const rail = Number(rec.rail)
+    const dock = Number(rec.dock)
+    return {
+      rail: Number.isFinite(rail) ? clampSize(rail, RAIL_MIN, railMax()) : DEFAULT_SIZES.rail,
+      dock: Number.isFinite(dock) ? clampSize(dock, DOCK_MIN, dockMax()) : DEFAULT_SIZES.dock,
+    }
+  } catch { return { ...DEFAULT_SIZES } }
+}
+
 type RecipeTab = 'view' | 'edit'
 type SecretEntry = { key: string; value: string }
 type TreeEntry = { kind: 'folder'; path: string; name: string; level: number } | { kind: 'recipe'; recipe: Recipe; level: number }
@@ -144,7 +166,11 @@ function App() {
   const toggleRunContext = (id: string) =>
     setRunContexts(ids => ids.includes(id) ? ids.filter(x => x !== id) : [...ids, id])
   // Persist the per-run time limit chosen on the View tab.
+  const [panelSizes, setPanelSizes] = createSignal<PanelSizes>(loadPanelSizes())
+  const [resizing, setResizing] = createSignal<'rail' | 'dock' | 'both' | null>(null)
   createEffect(() => localStorage.setItem(MAXRT_KEY, String(maxRuntime())))
+  // Sizes are committed between gestures, not on every pointermove.
+  createEffect(() => { if (!resizing()) localStorage.setItem(SIZES_KEY, JSON.stringify(panelSizes())) })
   createEffect(() => localStorage.setItem('devbox.collapsed-recipe-folders', JSON.stringify(collapsedFolders())))
 
   const startNewRecipe = (prefix = '') => {
@@ -218,7 +244,54 @@ function App() {
   const pollTimer = window.setInterval(() => { void store.refreshRuns() }, RUNS_REFRESH_MS)
   const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setModal(null) }
   window.addEventListener('keydown', onKey)
-  onCleanup(() => { window.clearInterval(pollTimer); window.removeEventListener('keydown', onKey) })
+
+  // ---- split-pane resizing (drag, keyboard, double-click reset) ----
+  const applyResize = (axis: 'rail' | 'dock' | 'both', dRail: number, dDock: number, base: PanelSizes = panelSizes()) =>
+    setPanelSizes(() => ({
+      rail: axis === 'dock' ? base.rail : clampSize(base.rail + dRail, RAIL_MIN, railMax()),
+      dock: axis === 'rail' ? base.dock : clampSize(base.dock + dDock, DOCK_MIN, dockMax()),
+    }))
+  const beginResize = (axis: 'rail' | 'dock' | 'both') => (e: PointerEvent) => {
+    if (e.button !== 0) return
+    e.preventDefault()
+    const start = { x: e.clientX, y: e.clientY }
+    const base = panelSizes()
+    setResizing(axis)
+    ;(e.currentTarget as HTMLElement).setPointerCapture(e.pointerId)
+    document.body.classList.add('resizing')
+    document.body.dataset.resizeCursor = axis === 'rail' ? 'col' : axis === 'dock' ? 'row' : 'both'
+    const onMove = (ev: PointerEvent) =>
+      applyResize(axis, ev.clientX - start.x, start.y - ev.clientY, base)
+    const stop = () => {
+      setResizing(null)
+      document.body.classList.remove('resizing')
+      delete document.body.dataset.resizeCursor
+      window.removeEventListener('pointermove', onMove)
+      window.removeEventListener('pointerup', stop)
+      window.removeEventListener('pointercancel', stop)
+    }
+    window.addEventListener('pointermove', onMove)
+    window.addEventListener('pointerup', stop)
+    window.addEventListener('pointercancel', stop)
+  }
+  const gutterKeys = (axis: 'rail' | 'dock' | 'both') => (e: KeyboardEvent) => {
+    const step = e.shiftKey ? 48 : 16
+    const dRail = axis === 'dock' ? 0 : e.key === 'ArrowRight' ? step : e.key === 'ArrowLeft' ? -step : 0
+    const dDock = axis === 'rail' ? 0 : e.key === 'ArrowUp' ? step : e.key === 'ArrowDown' ? -step : 0
+    if (!dRail && !dDock) return
+    e.preventDefault()
+    applyResize(axis, dRail, dDock)
+  }
+  const resetGutter = (axis: 'rail' | 'dock' | 'both') => () => {
+    const s = panelSizes()
+    applyResize(axis, DEFAULT_SIZES.rail - s.rail, DEFAULT_SIZES.dock - s.dock)
+  }
+  const onWinResize = () => applyResize('both', 0, 0)
+  window.addEventListener('resize', onWinResize)
+
+  onCleanup(() => {
+    window.clearInterval(pollTimer); window.removeEventListener('keydown', onKey); window.removeEventListener('resize', onWinResize)
+  })
 
   async function saveServer(draft: Partial<Server>) {
     try {
@@ -308,7 +381,11 @@ function App() {
   const statusLabel: Record<Run['status'], string> = { running: 'Running', succeeded: 'OK', failed: 'Failed' }
 
   return (
-    <div class="shell">
+    <div
+      class="shell"
+      classList={{ 'drag-rail': resizing() === 'rail', 'drag-dock': resizing() === 'dock', 'drag-both': resizing() === 'both' }}
+      style={{ '--rail-w': `${Math.round(panelSizes().rail)}px`, '--dock-h': `${Math.round(panelSizes().dock)}px` }}
+    >
       <header class="command">
         <div class="brand">
           <span class="brand-mark"><Icon d={icons.box} size={17} /></span>
@@ -324,7 +401,7 @@ function App() {
       <Show when={error()}><div class="toast error" role="alert">{error()}</div></Show>
 
       <div class="workspace">
-        <section class="panel rail" aria-label="Inventory and recipes">
+        <section class="panel rail" id="rail-panel" aria-label="Inventory and recipes">
           <div class="rail-head">
             <nav class="segmented" role="tablist">
               <button role="tab" aria-selected={railTab() === 'recipes'} classList={{ active: railTab() === 'recipes' }} onClick={() => setRailTab('recipes')}>Recipes <b>{recipes().length}</b></button>
@@ -353,7 +430,7 @@ function App() {
                 )}
               </For>
             }>
-              <div classList={{ 'recipe-tree': true, 'root-drop-target': dropTarget() === '' }} onDragOver={e => { e.preventDefault(); setDropTarget('') }} onDragLeave={() => setDropTarget(null)} onDrop={e => { e.preventDefault(); const name = e.dataTransfer?.getData('text/plain'); const recipe = name ? recipesByName().get(name) : undefined; if (recipe) void moveRecipe(recipe, ''); setDropTarget(null) }}>
+              <div classList={{ 'recipe-tree': true, 'root-drop-target': dropTarget() === '' }} onDragOver={e => { e.preventDefault(); setDropTarget((e.target as Element)?.closest?.('[data-drop-folder]')?.getAttribute('data-drop-folder') ?? '') }} onDragLeave={e => { if (e.target === e.currentTarget) setDropTarget(null) }} onDrop={e => { e.preventDefault(); const name = e.dataTransfer?.getData('text/plain'); const recipe = name ? recipesByName().get(name) : undefined; if (recipe) void moveRecipe(recipe, (e.target as Element)?.closest?.('[data-drop-folder]')?.getAttribute('data-drop-folder') ?? ''); setDropTarget(null) }}>
                 <Show when={folderDraft()}>
                   <form class="folder-draft" onSubmit={e => { e.preventDefault(); void createFolder() }}>
                     <Icon d={icons.folder} /><input autofocus value={folderPath()} onInput={e => { setFolderPath(e.currentTarget.value); setFolderError('') }} placeholder="folder/path" aria-label="New folder path" />
@@ -364,12 +441,12 @@ function App() {
                 </Show>
                 <For each={treeEntries()} fallback={<p class="empty">No recipes yet.<button class="btn ghost" onClick={() => startNewRecipe()}>Write your first Bun shell recipe</button></p>}>
                   {entry => entry.kind === 'folder' ? (
-                    <div classList={{ 'tree-folder': true, 'drop-target': dropTarget() === entry.path }} style={{ 'padding-left': `${5 + entry.level * 17}px` }}  onDragOver={e => { e.preventDefault(); setDropTarget(entry.path) }} onDragLeave={() => setDropTarget(null)} onDrop={e => { e.preventDefault(); const name = e.dataTransfer?.getData('text/plain'); const recipe = name ? recipesByName().get(name) : undefined; if (recipe) void moveRecipe(recipe, entry.path); setDropTarget(null) }}>
+                    <div classList={{ 'tree-folder': true, 'drop-target': dropTarget() === entry.path }} data-drop-folder={entry.path} style={{ 'padding-left': `${5 + entry.level * 17}px` }}>
                       <button class="folder-toggle" aria-expanded={!collapsedFolders().includes(entry.path)} onClick={() => toggleFolder(entry.path)}><span classList={{ chevron: true, collapsed: collapsedFolders().includes(entry.path) }}><Icon d={icons.chevron} size={14} /></span><Icon d={icons.folder} size={15} /><strong>{entry.name}</strong></button>
                       <button class="chip folder-add" title={`New recipe in ${entry.path}`} onClick={() => startNewRecipe(`${entry.path}/`)}><Icon d={icons.plus} /></button>
                     </div>
                   ) : (
-                    <article draggable classList={{ row: true, 'tree-recipe': true, selected: !newRecipeDraft() && selectedRecipe() === entry.recipe.name }} style={{ 'padding-left': `${12 + entry.level * 17}px` }}  onDragStart={e => { e.dataTransfer?.setData('text/plain', entry.recipe.name); if (e.dataTransfer) e.dataTransfer.effectAllowed = 'move' }} onDragEnd={() => setDropTarget(null)} onClick={() => selectRecipe(entry.recipe.name)}>
+                    <article draggable="true" data-drop-folder={entry.recipe.name.includes('/') ? entry.recipe.name.slice(0, entry.recipe.name.lastIndexOf('/')) : ''} classList={{ row: true, 'tree-recipe': true, selected: !newRecipeDraft() && selectedRecipe() === entry.recipe.name }} style={{ 'padding-left': `${12 + entry.level * 17}px` }}  onDragStart={e => { e.dataTransfer?.setData('text/plain', entry.recipe.name); if (e.dataTransfer) e.dataTransfer.effectAllowed = 'move' }} onDragEnd={() => setDropTarget(null)} onClick={() => selectRecipe(entry.recipe.name)}>
                       <div class="row-main"><strong>{entry.recipe.name.slice(entry.recipe.name.lastIndexOf('/') + 1)}</strong><small>updated {fmtFull(entry.recipe.updated_at)}</small></div>
                       <div class="row-actions"><button class="chip run-chip" title={`Run ${entry.recipe.name}`} onClick={e => { e.stopPropagation(); runRecipe(entry.recipe.name) }}><Icon d={icons.play} /></button><button class="chip" title="Edit recipe" onClick={e => { e.stopPropagation(); openRecipeEdit(entry.recipe.name) }}><Icon d={icons.pencil} /></button><button class="chip danger-chip" title="Delete recipe" onClick={e => { e.stopPropagation(); removeRecipe(entry.recipe.name) }}><Icon d={icons.trash} /></button></div>
                     </article>
@@ -380,7 +457,14 @@ function App() {
           </div>
         </section>
 
-        <section class="panel detail" aria-label="Selection detail">
+        <div
+          class="gutter gutter-v" role="separator" tabIndex={0} aria-orientation="vertical"
+          aria-label="Resize recipe list and detail panels" aria-controls="rail-panel detail-panel"
+          aria-valuenow={Math.round(panelSizes().rail)} aria-valuemin={RAIL_MIN} aria-valuemax={railMax()}
+          title="Drag or use arrow keys to resize — double-click to reset"
+          onPointerDown={beginResize('rail')} onKeyDown={gutterKeys('rail')} onDblClick={resetGutter('rail')}
+        />
+        <section class="panel detail" id="detail-panel" aria-label="Selection detail">
           <Show when={railTab() === 'recipes'} fallback={
             <Show when={selectedServer()} fallback={<DetailHint kind="server" loaded={loaded()} onNew={() => setModal({ kind: 'server-form', draft: { port: 22 } })} />}>
               {srv => (
@@ -449,7 +533,22 @@ function App() {
         </section>
       </div>
 
-      <footer class="dock panel" aria-label="Recent executions">
+      <div
+        class="gutter gutter-h" role="separator" tabIndex={0} aria-orientation="horizontal"
+        aria-label="Resize executions dock" aria-controls="exec-dock"
+        aria-valuenow={Math.round(panelSizes().dock)} aria-valuemin={DOCK_MIN} aria-valuemax={dockMax()}
+        title="Drag or use arrow keys to resize — double-click to reset"
+        onPointerDown={beginResize('dock')} onKeyDown={gutterKeys('dock')} onDblClick={resetGutter('dock')}
+      />
+      <div
+        class="gutter gutter-c" role="separator" tabIndex={0}
+        aria-label="Resize all panels" aria-controls="rail-panel detail-panel exec-dock"
+        aria-valuetext={`${Math.round(panelSizes().rail)}px wide, ${Math.round(panelSizes().dock)}px tall`}
+        title="Drag to resize both — double-click to reset"
+        onPointerDown={beginResize('both')} onKeyDown={gutterKeys('both')} onDblClick={resetGutter('both')}
+      />
+
+      <footer class="dock panel" id="exec-dock" aria-label="Recent executions">
         <div class="dock-head">
           <h2><Icon d={icons.terminal} /> Executions</h2>
           <span classList={{ 'dock-hint': true, mono: true, live: live() }}>

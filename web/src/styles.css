@@ -45,7 +45,7 @@ button { cursor: pointer; border: 0; font: inherit; color: inherit; background: 
 button:disabled { cursor: default; opacity: .45 }
 input, textarea, select { font: inherit; color: var(--text); caret-color: var(--mint) }
 
-.shell { display: flex; flex-direction: column; height: 100vh }
+.shell { display: flex; flex-direction: column; height: 100vh; position: relative }
 
 /* ---------- command header ---------- */
 .command {
@@ -107,14 +107,61 @@ h1 { font-size: 20px; line-height: 1.1; margin: 0; letter-spacing: -.02em; font-
 
 /* ---------- workspace ---------- */
 .workspace {
-  flex: 1; min-height: 0;
-  display: grid; grid-template-columns: 380px minmax(0, 1fr); gap: 18px;
+  flex: 1; min-height: 0; position: relative;
+  display: grid; grid-template-columns: var(--rail-w, 380px) minmax(0, 1fr); gap: 18px;
   padding: 18px 26px;
 }
 .panel {
   border: 1px solid var(--line); background: var(--bg-raised);
   border-radius: 13px; box-shadow: 0 15px 60px rgba(0, 0, 0, .18);
 }
+
+/* ---------- resizable split gutters ---------- */
+.gutter {
+  position: absolute; z-index: 30; border-radius: 7px;
+  touch-action: none;
+}
+.gutter::after {
+  content: ''; position: absolute; border-radius: 2px;
+  background: var(--line); opacity: .5;
+  transition: background .15s ease, opacity .15s ease, box-shadow .15s ease;
+}
+.gutter:hover::after { opacity: 1; background: #46617c }
+.gutter:focus-visible {
+  outline: none; background: rgba(69, 209, 155, .05);
+  box-shadow: 0 0 0 2px rgba(69, 209, 155, .35);
+}
+.gutter:focus-visible::after { opacity: 1; background: var(--mint) }
+/* vertical: rides the gap between rail and detail, inside the workspace */
+.gutter-v { top: 18px; bottom: 0; left: calc(var(--rail-w, 380px) + 27px); width: 16px; cursor: col-resize }
+.gutter-v::after { top: 8px; bottom: 8px; left: 50%; width: 2px; margin-left: -1px }
+/* horizontal: rides the boundary between workspace and dock, centered on the dock's top edge */
+.gutter-h {
+  left: 26px; right: 26px; height: 14px;
+  bottom: calc(var(--dock-h, 216px) + 11px); cursor: row-resize;
+}
+.gutter-h::after { left: 8px; right: 8px; top: 50%; height: 2px; margin-top: -1px }
+/* corner: the intersection of both bars — drags both axes at once */
+.gutter-c {
+  left: calc(var(--rail-w, 380px) + 25px); bottom: calc(var(--dock-h, 216px) + 9px);
+  width: 20px; height: 18px;
+  cursor: nwse-resize; z-index: 31;
+}
+.gutter-c::after {
+  left: 50%; top: 50%; width: 13px; height: 2px; margin: -1px 0 0 -6.5px;
+  transform: rotate(45deg); opacity: .65;
+}
+/* active gesture: mint line + soft glow on every bar being dragged */
+.shell.drag-rail .gutter-v::after,
+.shell.drag-dock .gutter-h::after,
+.shell.drag-both .gutter-v::after, .shell.drag-both .gutter-h::after, .shell.drag-both .gutter-c::after {
+  opacity: 1; background: var(--mint); box-shadow: 0 0 12px rgba(69, 209, 155, .5);
+}
+
+body.resizing { user-select: none; -webkit-user-select: none }
+body.resizing, body.resizing * { cursor: col-resize !important }
+body.resizing[data-resize-cursor='row'], body.resizing[data-resize-cursor='row'] * { cursor: row-resize !important }
+body.resizing[data-resize-cursor='both'], body.resizing[data-resize-cursor='both'] * { cursor: nwse-resize !important }
 
 /* master rail */
 .rail { display: flex; flex-direction: column; min-height: 0 }
@@ -145,17 +192,19 @@ h1 { font-size: 20px; line-height: 1.1; margin: 0; letter-spacing: -.02em; font-
 .recipe-create-actions { display: flex; gap: 6px; margin-left: auto }
 .btn.icon-only { padding: 6px; width: 32px; justify-content: center }
 .recipe-tree { min-height: 100%; border: 1px solid transparent; border-radius: 9px }
-.recipe-tree.root-drop-target { border-color: rgba(69, 209, 155, .7); background: rgba(69, 209, 155, .05) }
+.recipe-tree { transition: border-color .12s ease, background-color .12s ease }
+.recipe-tree.root-drop-target { border-color: rgba(69, 209, 155, .85); background: rgba(69, 209, 155, .06) }
 .tree-folder, .folder-draft { display: flex; align-items: center; min-height: 35px; border: 1px solid transparent; border-radius: 8px; padding: 2px 5px 2px calc(5px + var(--tree-level, 0) * 17px); gap: 2px }
 .tree-folder:hover { background: rgba(23, 33, 45, .75) }
-.tree-folder.drop-target { border-color: rgba(69, 209, 155, .75); background: rgba(69, 209, 155, .1) }
+.tree-folder { transition: border-color .12s ease, background-color .12s ease, box-shadow .12s ease }
+.tree-folder.drop-target { border-color: rgba(69, 209, 155, .9); background: rgba(69, 209, 155, .14); box-shadow: inset 0 0 0 1px rgba(69, 209, 155, .25) }
 .folder-toggle { display: flex; min-width: 0; align-items: center; gap: 5px; flex: 1; text-align: left; color: var(--text-dim); padding: 5px 2px }
 .folder-toggle strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; color: var(--text) }
 .chevron { display: inline-flex; transition: transform .14s ease; color: var(--text-dim) }
 .chevron.collapsed { transform: rotate(-90deg) }
 .folder-add { opacity: 0; width: 24px; height: 24px }
 .tree-folder:hover .folder-add, .tree-folder:focus-within .folder-add { opacity: 1 }
-.tree-recipe { padding-left: calc(12px + var(--tree-level, 0) * 17px); cursor: grab }
+.tree-recipe { padding-left: calc(12px + var(--tree-level, 0) * 17px); cursor: grab; user-select: none; -webkit-user-select: none }
 .tree-recipe:active { cursor: grabbing }
 .folder-draft { flex-wrap: wrap; margin: 3px 0 7px; background: var(--bg-inset); border-color: var(--line-soft) }
 .folder-draft input { flex: 1; min-width: 120px; margin: 0; padding: 6px 8px; font-size: 12px }
@@ -241,7 +290,7 @@ input:focus, textarea:focus, select:focus { outline: none; border-color: var(--m
 
 /* ---------- activity dock ---------- */
 .dock {
-  margin: 0 26px 18px; height: 216px; min-height: 130px;
+  margin: 0 26px 18px; height: var(--dock-h, 216px); min-height: 128px;
   display: flex; flex-direction: column; overflow: hidden;
 }
 .dock-head {
@@ -320,6 +369,7 @@ input:focus, textarea:focus, select:focus { outline: none; border-color: var(--m
   html, body { height: auto }
   .shell { height: auto; min-height: 100vh }
   .workspace { grid-template-columns: 1fr; padding: 14px 16px }
+  .gutter { display: none }
   .rail { max-height: 44vh }
   .dock { margin: 0 16px 16px; height: auto; max-height: 300px }
   .dock-row { grid-template-columns: 86px 1fr 92px; grid-template-rows: auto auto; row-gap: 3px }
