@@ -4,5 +4,5 @@ cd web
 npm run build
 cd ..
 mkdir -p ./bin
-go build -o ./bin/devbox-manager ./cmd/devbox-manager
+PATH="$PATH:/home/andrei/.local/go/bin" go build -o ./bin/devbox-manager ./cmd/devbox-manager
 ./bin/devbox-manager service restart
