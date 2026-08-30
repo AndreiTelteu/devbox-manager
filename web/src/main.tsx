@@ -6,9 +6,54 @@
 
 import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show } from 'solid-js'
 import { render } from 'solid-js/web'
+import * as monaco from 'monaco-editor'
+import EditorWorker from 'monaco-editor/editor/editor.worker?worker'
+import TsWorker from 'monaco-editor/language/typescript/ts.worker?worker'
 import { connectEvents, store, useAppSelector } from './store'
 import type { Recipe, Run, Server } from './store'
 import './styles.css'
+
+// Monaco workers ship as bundled module workers (Vite `?worker`). The TypeScript
+// worker powers validation and autocomplete for Bun shell recipes; the base
+// editor worker covers every other part of the editor.
+;(globalThis as unknown as { MonacoEnvironment?: { getWorker(workerId: string, label: string): Worker } }).MonacoEnvironment = {
+  getWorker(_workerId, label) {
+    return label === 'typescript' || label === 'javascript' ? new TsWorker() : new EditorWorker()
+  },
+}
+
+monaco.editor.defineTheme('devbox-dark', {
+  base: 'vs-dark',
+  inherit: true,
+  rules: [
+    { token: 'comment', foreground: '5c6f82', fontStyle: 'italic' },
+    { token: 'keyword', foreground: '6fc1e8' },
+    { token: 'string', foreground: '8fd8a6' },
+    { token: 'number', foreground: 'e8b64c' },
+    { token: 'type', foreground: '6fc1e8' },
+    { token: 'identifier', foreground: 'ecf1fa' },
+    { token: 'delimiter', foreground: '9caaba' },
+  ],
+  colors: {
+    'editor.background': '#0b1018',
+    'editor.foreground': '#cfe0d6',
+    'editorLineNumber.foreground': '#3d4c5e',
+    'editorLineNumber.activeForeground': '#9cb0c4',
+    'editorCursor.foreground': '#45d19b',
+    'editor.selectionBackground': '#1c3d2f',
+    'editor.inactiveSelectionBackground': '#162a22',
+    'editor.lineHighlightBackground': '#121a25',
+    'editor.indentGuide.background1': '#1d2836',
+    'editor.indentGuide.activeBackground1': '#2f4052',
+    'editorBracketMatch.background': '#1c3d2f',
+    'editorBracketMatch.border': '#45d19b66',
+    'editorGutter.background': '#0b1018',
+    'minimap.background': '#0d121c',
+    'scrollbarSlider.background': '#2a394966',
+    'scrollbarSlider.hoverBackground': '#3a4c6066',
+    'scrollbarSlider.activeBackground': '#40546b88',
+  },
+})
 
 const bunStarter = `import { $ } from "bun"
 
@@ -58,6 +103,28 @@ const loadRunContexts = (): string[] => {
 const loadMaxRuntime = (): number => {
   const v = Number(localStorage.getItem(MAXRT_KEY))
   return Number.isFinite(v) && v > 0 ? Math.min(86400, Math.floor(v)) : 0
+}
+
+// Split-pane geometry: rail width and executions-dock height, persisted in px.
+const SIZES_KEY = 'devbox.panel-sizes'
+type PanelSizes = { rail: number; dock: number }
+const DEFAULT_SIZES: PanelSizes = { rail: 380, dock: 216 }
+const RAIL_MIN = 264
+const DOCK_MIN = 128
+const railMax = () => Math.max(RAIL_MIN, window.innerWidth - 540)
+const dockMax = () => Math.max(DOCK_MIN, window.innerHeight - 400)
+const clampSize = (v: number, lo: number, hi: number) => Math.min(Math.max(v, lo), Math.max(lo, hi))
+const loadPanelSizes = (): PanelSizes => {
+  try {
+    const raw: unknown = JSON.parse(localStorage.getItem(SIZES_KEY) ?? '{}')
+    const rec = (raw && typeof raw === 'object' ? raw : {}) as Record<string, unknown>
+    const rail = Number(rec.rail)
+    const dock = Number(rec.dock)
+    return {
+      rail: Number.isFinite(rail) ? clampSize(rail, RAIL_MIN, railMax()) : DEFAULT_SIZES.rail,
+      dock: Number.isFinite(dock) ? clampSize(dock, DOCK_MIN, dockMax()) : DEFAULT_SIZES.dock,
+    }
+  } catch { return { ...DEFAULT_SIZES } }
 }
 
 type RecipeTab = 'view' | 'edit'
@@ -144,7 +211,11 @@ function App() {
   const toggleRunContext = (id: string) =>
     setRunContexts(ids => ids.includes(id) ? ids.filter(x => x !== id) : [...ids, id])
   // Persist the per-run time limit chosen on the View tab.
+  const [panelSizes, setPanelSizes] = createSignal<PanelSizes>(loadPanelSizes())
+  const [resizing, setResizing] = createSignal<'rail' | 'dock' | 'both' | null>(null)
   createEffect(() => localStorage.setItem(MAXRT_KEY, String(maxRuntime())))
+  // Sizes are committed between gestures, not on every pointermove.
+  createEffect(() => { if (!resizing()) localStorage.setItem(SIZES_KEY, JSON.stringify(panelSizes())) })
   createEffect(() => localStorage.setItem('devbox.collapsed-recipe-folders', JSON.stringify(collapsedFolders())))
 
   const startNewRecipe = (prefix = '') => {
@@ -218,7 +289,54 @@ function App() {
   const pollTimer = window.setInterval(() => { void store.refreshRuns() }, RUNS_REFRESH_MS)
   const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setModal(null) }
   window.addEventListener('keydown', onKey)
-  onCleanup(() => { window.clearInterval(pollTimer); window.removeEventListener('keydown', onKey) })
+
+  // ---- split-pane resizing (drag, keyboard, double-click reset) ----
+  const applyResize = (axis: 'rail' | 'dock' | 'both', dRail: number, dDock: number, base: PanelSizes = panelSizes()) =>
+    setPanelSizes(() => ({
+      rail: axis === 'dock' ? base.rail : clampSize(base.rail + dRail, RAIL_MIN, railMax()),
+      dock: axis === 'rail' ? base.dock : clampSize(base.dock + dDock, DOCK_MIN, dockMax()),
+    }))
+  const beginResize = (axis: 'rail' | 'dock' | 'both') => (e: PointerEvent) => {
+    if (e.button !== 0) return
+    e.preventDefault()
+    const start = { x: e.clientX, y: e.clientY }
+    const base = panelSizes()
+    setResizing(axis)
+    ;(e.currentTarget as HTMLElement).setPointerCapture(e.pointerId)
+    document.body.classList.add('resizing')
+    document.body.dataset.resizeCursor = axis === 'rail' ? 'col' : axis === 'dock' ? 'row' : 'both'
+    const onMove = (ev: PointerEvent) =>
+      applyResize(axis, ev.clientX - start.x, start.y - ev.clientY, base)
+    const stop = () => {
+      setResizing(null)
+      document.body.classList.remove('resizing')
+      delete document.body.dataset.resizeCursor
+      window.removeEventListener('pointermove', onMove)
+      window.removeEventListener('pointerup', stop)
+      window.removeEventListener('pointercancel', stop)
+    }
+    window.addEventListener('pointermove', onMove)
+    window.addEventListener('pointerup', stop)
+    window.addEventListener('pointercancel', stop)
+  }
+  const gutterKeys = (axis: 'rail' | 'dock' | 'both') => (e: KeyboardEvent) => {
+    const step = e.shiftKey ? 48 : 16
+    const dRail = axis === 'dock' ? 0 : e.key === 'ArrowRight' ? step : e.key === 'ArrowLeft' ? -step : 0
+    const dDock = axis === 'rail' ? 0 : e.key === 'ArrowUp' ? step : e.key === 'ArrowDown' ? -step : 0
+    if (!dRail && !dDock) return
+    e.preventDefault()
+    applyResize(axis, dRail, dDock)
+  }
+  const resetGutter = (axis: 'rail' | 'dock' | 'both') => () => {
+    const s = panelSizes()
+    applyResize(axis, DEFAULT_SIZES.rail - s.rail, DEFAULT_SIZES.dock - s.dock)
+  }
+  const onWinResize = () => applyResize('both', 0, 0)
+  window.addEventListener('resize', onWinResize)
+
+  onCleanup(() => {
+    window.clearInterval(pollTimer); window.removeEventListener('keydown', onKey); window.removeEventListener('resize', onWinResize)
+  })
 
   async function saveServer(draft: Partial<Server>) {
     try {
@@ -308,7 +426,11 @@ function App() {
   const statusLabel: Record<Run['status'], string> = { running: 'Running', succeeded: 'OK', failed: 'Failed' }
 
   return (
-    <div class="shell">
+    <div
+      class="shell"
+      classList={{ 'drag-rail': resizing() === 'rail', 'drag-dock': resizing() === 'dock', 'drag-both': resizing() === 'both' }}
+      style={{ '--rail-w': `${Math.round(panelSizes().rail)}px`, '--dock-h': `${Math.round(panelSizes().dock)}px` }}
+    >
       <header class="command">
         <div class="brand">
           <span class="brand-mark"><Icon d={icons.box} size={17} /></span>
@@ -324,7 +446,7 @@ function App() {
       <Show when={error()}><div class="toast error" role="alert">{error()}</div></Show>
 
       <div class="workspace">
-        <section class="panel rail" aria-label="Inventory and recipes">
+        <section class="panel rail" id="rail-panel" aria-label="Inventory and recipes">
           <div class="rail-head">
             <nav class="segmented" role="tablist">
               <button role="tab" aria-selected={railTab() === 'recipes'} classList={{ active: railTab() === 'recipes' }} onClick={() => setRailTab('recipes')}>Recipes <b>{recipes().length}</b></button>
@@ -353,7 +475,7 @@ function App() {
                 )}
               </For>
             }>
-              <div classList={{ 'recipe-tree': true, 'root-drop-target': dropTarget() === '' }} onDragOver={e => { e.preventDefault(); setDropTarget('') }} onDragLeave={() => setDropTarget(null)} onDrop={e => { e.preventDefault(); const name = e.dataTransfer?.getData('text/plain'); const recipe = name ? recipesByName().get(name) : undefined; if (recipe) void moveRecipe(recipe, ''); setDropTarget(null) }}>
+              <div classList={{ 'recipe-tree': true, 'root-drop-target': dropTarget() === '' }} onDragOver={e => { e.preventDefault(); setDropTarget((e.target as Element)?.closest?.('[data-drop-folder]')?.getAttribute('data-drop-folder') ?? '') }} onDragLeave={e => { if (e.target === e.currentTarget) setDropTarget(null) }} onDrop={e => { e.preventDefault(); const name = e.dataTransfer?.getData('text/plain'); const recipe = name ? recipesByName().get(name) : undefined; if (recipe) void moveRecipe(recipe, (e.target as Element)?.closest?.('[data-drop-folder]')?.getAttribute('data-drop-folder') ?? ''); setDropTarget(null) }}>
                 <Show when={folderDraft()}>
                   <form class="folder-draft" onSubmit={e => { e.preventDefault(); void createFolder() }}>
                     <Icon d={icons.folder} /><input autofocus value={folderPath()} onInput={e => { setFolderPath(e.currentTarget.value); setFolderError('') }} placeholder="folder/path" aria-label="New folder path" />
@@ -364,12 +486,12 @@ function App() {
                 </Show>
                 <For each={treeEntries()} fallback={<p class="empty">No recipes yet.<button class="btn ghost" onClick={() => startNewRecipe()}>Write your first Bun shell recipe</button></p>}>
                   {entry => entry.kind === 'folder' ? (
-                    <div classList={{ 'tree-folder': true, 'drop-target': dropTarget() === entry.path }} style={{ 'padding-left': `${5 + entry.level * 17}px` }}  onDragOver={e => { e.preventDefault(); setDropTarget(entry.path) }} onDragLeave={() => setDropTarget(null)} onDrop={e => { e.preventDefault(); const name = e.dataTransfer?.getData('text/plain'); const recipe = name ? recipesByName().get(name) : undefined; if (recipe) void moveRecipe(recipe, entry.path); setDropTarget(null) }}>
+                    <div classList={{ 'tree-folder': true, 'drop-target': dropTarget() === entry.path }} data-drop-folder={entry.path} style={{ 'padding-left': `${5 + entry.level * 17}px` }}>
                       <button class="folder-toggle" aria-expanded={!collapsedFolders().includes(entry.path)} onClick={() => toggleFolder(entry.path)}><span classList={{ chevron: true, collapsed: collapsedFolders().includes(entry.path) }}><Icon d={icons.chevron} size={14} /></span><Icon d={icons.folder} size={15} /><strong>{entry.name}</strong></button>
                       <button class="chip folder-add" title={`New recipe in ${entry.path}`} onClick={() => startNewRecipe(`${entry.path}/`)}><Icon d={icons.plus} /></button>
                     </div>
                   ) : (
-                    <article draggable classList={{ row: true, 'tree-recipe': true, selected: !newRecipeDraft() && selectedRecipe() === entry.recipe.name }} style={{ 'padding-left': `${12 + entry.level * 17}px` }}  onDragStart={e => { e.dataTransfer?.setData('text/plain', entry.recipe.name); if (e.dataTransfer) e.dataTransfer.effectAllowed = 'move' }} onDragEnd={() => setDropTarget(null)} onClick={() => selectRecipe(entry.recipe.name)}>
+                    <article draggable="true" data-drop-folder={entry.recipe.name.includes('/') ? entry.recipe.name.slice(0, entry.recipe.name.lastIndexOf('/')) : ''} classList={{ row: true, 'tree-recipe': true, selected: !newRecipeDraft() && selectedRecipe() === entry.recipe.name }} style={{ 'padding-left': `${12 + entry.level * 17}px` }}  onDragStart={e => { e.dataTransfer?.setData('text/plain', entry.recipe.name); if (e.dataTransfer) e.dataTransfer.effectAllowed = 'move' }} onDragEnd={() => setDropTarget(null)} onClick={() => selectRecipe(entry.recipe.name)}>
                       <div class="row-main"><strong>{entry.recipe.name.slice(entry.recipe.name.lastIndexOf('/') + 1)}</strong><small>updated {fmtFull(entry.recipe.updated_at)}</small></div>
                       <div class="row-actions"><button class="chip run-chip" title={`Run ${entry.recipe.name}`} onClick={e => { e.stopPropagation(); runRecipe(entry.recipe.name) }}><Icon d={icons.play} /></button><button class="chip" title="Edit recipe" onClick={e => { e.stopPropagation(); openRecipeEdit(entry.recipe.name) }}><Icon d={icons.pencil} /></button><button class="chip danger-chip" title="Delete recipe" onClick={e => { e.stopPropagation(); removeRecipe(entry.recipe.name) }}><Icon d={icons.trash} /></button></div>
                     </article>
@@ -380,7 +502,14 @@ function App() {
           </div>
         </section>
 
-        <section class="panel detail" aria-label="Selection detail">
+        <div
+          class="gutter gutter-v" role="separator" tabIndex={0} aria-orientation="vertical"
+          aria-label="Resize recipe list and detail panels" aria-controls="rail-panel detail-panel"
+          aria-valuenow={Math.round(panelSizes().rail)} aria-valuemin={RAIL_MIN} aria-valuemax={railMax()}
+          title="Drag or use arrow keys to resize — double-click to reset"
+          onPointerDown={beginResize('rail')} onKeyDown={gutterKeys('rail')} onDblClick={resetGutter('rail')}
+        />
+        <section class="panel detail" id="detail-panel" aria-label="Selection detail">
           <Show when={railTab() === 'recipes'} fallback={
             <Show when={selectedServer()} fallback={<DetailHint kind="server" loaded={loaded()} onNew={() => setModal({ kind: 'server-form', draft: { port: 22 } })} />}>
               {srv => (
@@ -449,7 +578,22 @@ function App() {
         </section>
       </div>
 
-      <footer class="dock panel" aria-label="Recent executions">
+      <div
+        class="gutter gutter-h" role="separator" tabIndex={0} aria-orientation="horizontal"
+        aria-label="Resize executions dock" aria-controls="exec-dock"
+        aria-valuenow={Math.round(panelSizes().dock)} aria-valuemin={DOCK_MIN} aria-valuemax={dockMax()}
+        title="Drag or use arrow keys to resize — double-click to reset"
+        onPointerDown={beginResize('dock')} onKeyDown={gutterKeys('dock')} onDblClick={resetGutter('dock')}
+      />
+      <div
+        class="gutter gutter-c" role="separator" tabIndex={0}
+        aria-label="Resize all panels" aria-controls="rail-panel detail-panel exec-dock"
+        aria-valuetext={`${Math.round(panelSizes().rail)}px wide, ${Math.round(panelSizes().dock)}px tall`}
+        title="Drag to resize both — double-click to reset"
+        onPointerDown={beginResize('both')} onKeyDown={gutterKeys('both')} onDblClick={resetGutter('both')}
+      />
+
+      <footer class="dock panel" id="exec-dock" aria-label="Recent executions">
         <div class="dock-head">
           <h2><Icon d={icons.terminal} /> Executions</h2>
           <span classList={{ 'dock-hint': true, mono: true, live: live() }}>
@@ -560,17 +704,69 @@ function RecipeView(props: {
           }}
         />
       </label>
-      <p class="scope-note">The <code class="mono">local</code> server runs directly with Bun on this Debian host. Other checked servers run over SSH in <code class="mono">nix-shell -p bun</code>. Use <code class="mono">0</code> for no time limit.</p>
       <div class="detail-actions">
         <Show when={props.onRun}>
-          <button class="btn primary" onClick={() => props.onRun!()}><Icon d={icons.play} /> Run now</button>
+          <button class="btn primary sm" onClick={() => props.onRun!()}><Icon d={icons.play} /> Run now</button>
         </Show>
         <Show when={props.onDelete}>
-          <button class="btn ghost danger" onClick={() => props.onDelete!()}><Icon d={icons.trash} /> Delete</button>
+          <button class="btn ghost danger sm" onClick={() => props.onDelete!()}><Icon d={icons.trash} /> Delete</button>
         </Show>
       </div>
     </>
   )
+}
+
+function MonacoEditor(props: { value: string; readOnly: boolean; onChange: (value: string) => void }) {
+  let host!: HTMLDivElement
+  let editor: monaco.editor.IStandaloneCodeEditor | undefined
+  let programmatic = false
+
+  onMount(() => {
+    editor = monaco.editor.create(host, {
+      value: props.value,
+      language: 'typescript',
+      theme: 'devbox-dark',
+      readOnly: props.readOnly,
+      automaticLayout: true,
+      minimap: { enabled: true, side: 'right', renderCharacters: false, scale: 1, maxColumn: 100 },
+      fontFamily: '"DM Mono", ui-monospace, SFMono-Regular, Menlo, monospace',
+      fontSize: 13,
+      lineHeight: 20,
+      tabSize: 2,
+      insertSpaces: true,
+      wordWrap: 'off',
+      scrollBeyondLastLine: false,
+      smoothScrolling: true,
+      cursorBlinking: 'smooth',
+      cursorSmoothCaretAnimation: 'on',
+      renderLineHighlight: 'all',
+      lineNumbersMinChars: 3,
+      glyphMargin: false,
+      folding: true,
+      foldingHighlight: false,
+      padding: { top: 14, bottom: 14 },
+      scrollbar: { verticalScrollbarSize: 10, horizontalScrollbarSize: 10, useShadows: false },
+      overviewRulerBorder: false,
+      bracketPairColorization: { enabled: true },
+      guides: { bracketPairs: true, indentation: true, highlightActiveIndentation: true },
+      suggest: { preview: true },
+      stickyScroll: { enabled: false },
+    })
+    editor.onDidChangeModelContent(() => { if (!programmatic) props.onChange(editor!.getValue()) })
+  })
+
+  createEffect(() => editor?.updateOptions({ readOnly: props.readOnly }))
+  createEffect(() => {
+    if (editor && editor.getValue() !== props.value) {
+      programmatic = true
+      editor.setValue(props.value)
+      programmatic = false
+    }
+  })
+
+  onCleanup(() => { editor?.dispose(); editor = undefined })
+
+  return <div class="monaco-wrap" ref={el => { host = el }} />
 }
 
 function RecipeEditor(props: {
@@ -581,25 +777,54 @@ function RecipeEditor(props: {
 }) {
   const [name, setName] = createSignal(props.recipe?.name ?? props.initialName ?? '')
   const [content, setContent] = createSignal(props.recipe?.content ?? bunStarter)
+  // Opening an existing recipe shows it locked; the buffer stays read-only until
+  // the author presses Edit. Brand-new recipes start unlocked.
+  const [readOnly, setReadOnly] = createSignal(props.recipe !== null)
   const [busy, setBusy] = createSignal(false)
+
+  // Switching recipes (or a reload) reloads the buffer and re-arms the lock.
+  createEffect(() => {
+    setName(props.recipe?.name ?? props.initialName ?? '')
+    setContent(props.recipe?.content ?? bunStarter)
+    setReadOnly(props.recipe !== null)
+  })
+
   const submit = () => {
-    if (busy()) return
+    if (readOnly() || busy()) return
     setBusy(true)
-    // Editing an existing recipe sends the (possibly renamed) path so the
-    // backend can move the file; creating sends only the new name.
     props.onSave({ name: name().trim(), content: content() }).finally(() => setBusy(false))
   }
+
   return (
     <form class="recipe-form" onSubmit={e => { e.preventDefault(); submit() }}>
-      <label>Name <Show when={props.recipe}><span class="hint">— rename or change the path to move the recipe</span></Show>
-        <input required value={name()} onInput={e => setName(e.currentTarget.value)} placeholder="Install nginx" />
+      <label class="recipe-name">Name
+        <Show when={props.recipe}><span class="field-hint">rename or change the path to move the recipe</span></Show>
+        <input required readOnly={readOnly()} value={name()} onInput={e => setName(e.currentTarget.value)} placeholder="Install nginx" />
       </label>
-      <label>Recipe content — Bun shell script
-        <textarea class="mono" required spellcheck={false} rows={16} value={content()} onInput={e => setContent(e.currentTarget.value)} />
-      </label>
-      <div class="detail-actions">
-        <button type="submit" class="btn primary" disabled={busy()}>{busy() ? 'Saving…' : props.recipe ? 'Save changes' : 'Save recipe'}</button>
-        <button type="button" class="btn ghost" onClick={props.onCancel}>Cancel</button>
+
+      <div class="editor-frame">
+        <div class="editor-head">
+          <span class="editor-label">Recipe content — Bun shell script</span>
+          <span classList={{ 'editor-state': true, editing: !readOnly() }}>
+            <Show when={readOnly()} fallback="Editing — save to write the file">Read only</Show>
+          </span>
+        </div>
+        <MonacoEditor value={content()} readOnly={readOnly()} onChange={setContent} />
+        <div class="editor-bar">
+          <span class="editor-note">
+            <Show when={readOnly()} fallback="Changes are staged until you save.">
+              <Icon d={icons.eye} size={13} /> Locked to prevent accidental changes.
+            </Show>
+          </span>
+          <div class="editor-actions">
+            <button type="button" class="btn ghost sm" onClick={props.onCancel}>Cancel</button>
+            <Show when={readOnly()} fallback={
+              <button type="submit" class="btn primary sm" disabled={busy()}>{busy() ? 'Saving…' : props.recipe ? 'Save changes' : 'Save recipe'}</button>
+            }>
+              <button type="button" class="btn primary sm" onClick={() => setReadOnly(false)}><Icon d={icons.pencil} size={13} /> Edit</button>
+            </Show>
+          </div>
+        </div>
       </div>
     </form>
   )

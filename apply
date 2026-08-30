@@ -1,0 +1,10 @@
+#!/usr/bin/bash
+set -euo pipefail
+cd web
+npm run build
+rm -rf ../cmd/devbox-manager/web
+cp -r dist ../cmd/devbox-manager/web
+cd ..
+mkdir -p ./bin
+PATH="$PATH:/home/andrei/.local/go/bin" go build -o ./bin/devbox-manager ./cmd/devbox-manager
+./bin/devbox-manager service restart

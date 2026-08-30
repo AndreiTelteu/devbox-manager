@@ -9,11 +9,12 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "monaco-editor": "^0.56.0",
     "solid-js": "^1.9.7"
   },
   "devDependencies": {
-    "vite-plugin-solid": "^2.11.8",
     "typescript": "~5.8.3",
-    "vite": "^6.3.5"
+    "vite": "^6.3.5",
+    "vite-plugin-solid": "^2.11.8"
   }
 }
