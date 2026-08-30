@@ -1,6 +1,8 @@
 #!/usr/bin/bash
+set -euo pipefail
 cd web
 npm run build
 cd ..
+mkdir -p ./bin
 go build -o ./bin/devbox-manager ./cmd/devbox-manager
 ./bin/devbox-manager service restart
