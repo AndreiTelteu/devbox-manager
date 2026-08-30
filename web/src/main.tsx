@@ -127,7 +127,7 @@ const loadPanelSizes = (): PanelSizes => {
   } catch { return { ...DEFAULT_SIZES } }
 }
 
-type RecipeTab = 'view' | 'edit'
+
 type SecretEntry = { key: string; value: string }
 type TreeEntry = { kind: 'folder'; path: string; name: string; level: number } | { kind: 'recipe'; recipe: Recipe; level: number }
 const isLocalServer = (server: Pick<Server, 'name'>) => server.name.trim().toLowerCase() === 'local'
@@ -169,7 +169,7 @@ function App() {
   const [railTab, setRailTab] = createSignal<'recipes' | 'servers'>('recipes')
   const [selectedRecipe, setSelectedRecipe] = createSignal<string | null>(null)
   const [selectedServerID, setSelectedServerID] = createSignal<number | null>(null)
-  const [recipeTab, setRecipeTab] = createSignal<RecipeTab>('view')
+
   const [newRecipeDraft, setNewRecipeDraft] = createSignal(false)
   const [draftName, setDraftName] = createSignal('')
   const [collapsedFolders, setCollapsedFolders] = createSignal<string[]>((() => {
@@ -224,24 +224,17 @@ function App() {
     setSelectedServerID(null)
     setNewRecipeDraft(true)
     setRailTab('recipes')
-    setRecipeTab('edit')
   }
   const selectRecipe = (name: string) => {
     setNewRecipeDraft(false)
     setSelectedServerID(null)
     setSelectedRecipe(name)
-    setRecipeTab('view')
   }
   const openRecipeEdit = (name: string) => {
     setNewRecipeDraft(false)
     setSelectedServerID(null)
     setSelectedRecipe(name)
     setRailTab('recipes')
-    setRecipeTab('edit')
-  }
-  const cancelRecipeEdit = () => {
-    setNewRecipeDraft(false)
-    setRecipeTab('view')
   }
   const toggleFolder = (path: string) => setCollapsedFolders(paths => paths.includes(path) ? paths.filter(p => p !== path) : [...paths, path])
   const validateFolder = (raw: string) => {
@@ -369,7 +362,6 @@ function App() {
       }
       setNewRecipeDraft(false)
       await reload()
-      setRecipeTab('view')
       message(selected ? 'Recipe updated.' : 'Recipe saved.')
     } catch (e) { fail(e) }
   }
@@ -386,7 +378,7 @@ function App() {
       try {
         await api(`/recipes/${encodeURIComponent(name)}`, { method: 'DELETE' })
         setModal(null)
-        if (selectedRecipe() === name) { setSelectedRecipe(null); setRecipeTab('view') }
+        if (selectedRecipe() === name) setSelectedRecipe(null)
         await reload(); message('Recipe deleted.')
       } catch (e) { fail(e) }
     })
@@ -543,12 +535,9 @@ function App() {
                 {rec => (
                   <RecipeDetail
                     recipe={rec}
-                    tab={recipeTab()}
-                    onTab={setRecipeTab}
                     onSave={saveRecipe}
                     onRun={() => runRecipe(rec.name)}
                     onDelete={() => removeRecipe(rec.name)}
-                    onCancelEdit={cancelRecipeEdit}
                     servers={servers()}
                     runContexts={runContexts()}
                     onToggleContext={toggleRunContext}
@@ -561,12 +550,9 @@ function App() {
               <RecipeDetail
                 recipe={null}
                 initialName={draftName()}
-                tab={recipeTab()}
-                onTab={setRecipeTab}
                 onSave={saveRecipe}
                 onRun={null}
                 onDelete={null}
-                onCancelEdit={cancelRecipeEdit}
                 servers={servers()}
                 runContexts={runContexts()}
                 onToggleContext={toggleRunContext}
@@ -627,17 +613,14 @@ function App() {
   )
 }
 
-// ---------- recipe detail: View / Edit ----------
+// ---------- recipe detail ----------
 
 function RecipeDetail(props: {
   recipe: Recipe | null
   initialName?: string
-  tab: RecipeTab
-  onTab: (t: RecipeTab) => void
   onSave: (d: { name?: string; content: string }) => Promise<void>
   onRun: (() => void) | null
   onDelete: (() => void) | null
-  onCancelEdit: () => void
   servers: Server[]
   runContexts: string[]
   onToggleContext: (id: string) => void
@@ -645,74 +628,18 @@ function RecipeDetail(props: {
   onMaxRuntime: (v: number) => void
 }) {
   return (
-    <>
-      <div class="detail-head">
-        <h2>{props.recipe?.name ?? 'New recipe'}</h2>
-        <a class="tag" href="https://bun.com/docs/runtime/shell" target="_blank" rel="noreferrer">Bun shell</a>
-      </div>
-      <nav class="segmented detail-tabs" role="tablist" aria-label="Recipe editing mode">
-        <button role="tab" aria-selected={props.tab === 'view'} classList={{ active: props.tab === 'view' }} onClick={() => props.onTab('view')}><Icon d={icons.eye} size={13} /> View</button>
-        <button role="tab" aria-selected={props.tab === 'edit'} classList={{ active: props.tab === 'edit' }} onClick={() => props.onTab('edit')}><Icon d={icons.pencil} size={13} /> Edit</button>
-      </nav>
-      <Show when={props.tab === 'view' && props.recipe}>
-        <RecipeView
-          recipe={props.recipe as Recipe}
-          onRun={props.onRun}
-          onDelete={props.onDelete}
-          servers={props.servers}
-          runContexts={props.runContexts}
-          onToggleContext={props.onToggleContext}
-          maxRuntime={props.maxRuntime}
-          onMaxRuntime={props.onMaxRuntime}
-        />
-      </Show>
-      <Show when={props.tab === 'edit'}>
-        <RecipeEditor recipe={props.recipe} initialName={props.initialName} onSave={props.onSave} onCancel={props.onCancelEdit} />
-      </Show>
-    </>
-  )
-}
-
-function RecipeView(props: {
-  recipe: Recipe
-  onRun: (() => void) | null
-  onDelete: (() => void) | null
-  servers: Server[]
-  runContexts: string[]
-  onToggleContext: (id: string) => void
-  maxRuntime: number
-  onMaxRuntime: (v: number) => void
-}) {
-  return (
-    <>
-      <pre class="recipe-source mono" tabIndex={0}>{props.recipe.content}</pre>
-      <div class="run-target">Execution context
-        <ContextMultiSelect servers={props.servers} selected={props.runContexts} onToggle={props.onToggleContext} />
-      </div>
-      <label class="run-target" for="max-runtime-input">Max runtime per run (seconds)
-        <input
-          id="max-runtime-input"
-          class="run-limit"
-          type="number"
-          min="0"
-          max="86400"
-          step="1"
-          value={props.maxRuntime}
-          onInput={e => {
-            const v = Math.floor(Number(e.currentTarget.value) || 0)
-            props.onMaxRuntime(Math.max(0, Math.min(86400, v)))
-          }}
-        />
-      </label>
-      <div class="detail-actions">
-        <Show when={props.onRun}>
-          <button class="btn primary sm" onClick={() => props.onRun!()}><Icon d={icons.play} /> Run now</button>
-        </Show>
-        <Show when={props.onDelete}>
-          <button class="btn ghost danger sm" onClick={() => props.onDelete!()}><Icon d={icons.trash} /> Delete</button>
-        </Show>
-      </div>
-    </>
+    <RecipeEditor
+      recipe={props.recipe}
+      initialName={props.initialName}
+      onSave={props.onSave}
+      onRun={props.onRun}
+      onDelete={props.onDelete}
+      servers={props.servers}
+      runContexts={props.runContexts}
+      onToggleContext={props.onToggleContext}
+      maxRuntime={props.maxRuntime}
+      onMaxRuntime={props.onMaxRuntime}
+    />
   )
 }
 
@@ -773,16 +700,21 @@ function RecipeEditor(props: {
   recipe: Recipe | null
   initialName?: string
   onSave: (d: { name?: string; content: string }) => Promise<void>
-  onCancel: () => void
+  onRun: (() => void) | null
+  onDelete: (() => void) | null
+  servers: Server[]
+  runContexts: string[]
+  onToggleContext: (id: string) => void
+  maxRuntime: number
+  onMaxRuntime: (v: number) => void
 }) {
   const [name, setName] = createSignal(props.recipe?.name ?? props.initialName ?? '')
   const [content, setContent] = createSignal(props.recipe?.content ?? bunStarter)
-  // Opening an existing recipe shows it locked; the buffer stays read-only until
-  // the author presses Edit. Brand-new recipes start unlocked.
+  // Existing recipes open locked; toggle the edit switch in the title bar to unlock.
+  // New recipes start editable.
   const [readOnly, setReadOnly] = createSignal(props.recipe !== null)
   const [busy, setBusy] = createSignal(false)
 
-  // Switching recipes (or a reload) reloads the buffer and re-arms the lock.
   createEffect(() => {
     setName(props.recipe?.name ?? props.initialName ?? '')
     setContent(props.recipe?.content ?? bunStarter)
@@ -797,32 +729,70 @@ function RecipeEditor(props: {
 
   return (
     <form class="recipe-form" onSubmit={e => { e.preventDefault(); submit() }}>
-      <label class="recipe-name">Name
-        <Show when={props.recipe}><span class="field-hint">rename or change the path to move the recipe</span></Show>
-        <input required readOnly={readOnly()} value={name()} onInput={e => setName(e.currentTarget.value)} placeholder="Install nginx" />
-      </label>
+      <div class="recipe-titlebar">
+        <input
+          class="recipe-name-input mono"
+          required
+          readOnly={readOnly()}
+          value={name()}
+          onInput={e => setName(e.currentTarget.value)}
+          placeholder="recipe/name"
+          aria-label="Recipe name"
+        />
+        <label class="edit-switch" title={readOnly() ? 'Enable editing' : 'Lock editor'}>
+          <input
+            type="checkbox"
+            checked={!readOnly()}
+            onChange={e => {
+              const wantEdit = e.currentTarget.checked
+              if (!wantEdit && props.recipe) {
+                // Leaving edit mode without saving discards local changes.
+                setName(props.recipe.name)
+                setContent(props.recipe.content)
+              }
+              setReadOnly(!wantEdit)
+            }}
+          />
+          <span class="switch-track"><span class="switch-thumb" /></span>
+          <span class="switch-label">{readOnly() ? 'Read only' : 'Editing'}</span>
+        </label>
+      </div>
 
       <div class="editor-frame">
-        <div class="editor-head">
-          <span class="editor-label">Recipe content — Bun shell script</span>
-          <span classList={{ 'editor-state': true, editing: !readOnly() }}>
-            <Show when={readOnly()} fallback="Editing — save to write the file">Read only</Show>
-          </span>
-        </div>
         <MonacoEditor value={content()} readOnly={readOnly()} onChange={setContent} />
         <div class="editor-bar">
-          <span class="editor-note">
-            <Show when={readOnly()} fallback="Changes are staged until you save.">
-              <Icon d={icons.eye} size={13} /> Locked to prevent accidental changes.
-            </Show>
-          </span>
-          <div class="editor-actions">
-            <button type="button" class="btn ghost sm" onClick={props.onCancel}>Cancel</button>
-            <Show when={readOnly()} fallback={
-              <button type="submit" class="btn primary sm" disabled={busy()}>{busy() ? 'Saving…' : props.recipe ? 'Save changes' : 'Save recipe'}</button>
-            }>
-              <button type="button" class="btn primary sm" onClick={() => setReadOnly(false)}><Icon d={icons.pencil} size={13} /> Edit</button>
-            </Show>
+          <div class="run-controls">
+            <div class="run-field run-context-field">
+              <span class="run-label">Execution context</span>
+              <ContextMultiSelect servers={props.servers} selected={props.runContexts} onToggle={props.onToggleContext} />
+            </div>
+            <label class="run-field run-limit-field" for="max-runtime-input">
+              <span class="run-label">Max runtime (s)</span>
+              <input
+                id="max-runtime-input"
+                class="run-limit mono"
+                type="number"
+                min="0"
+                max="86400"
+                step="1"
+                value={props.maxRuntime}
+                onInput={e => {
+                  const v = Math.floor(Number(e.currentTarget.value) || 0)
+                  props.onMaxRuntime(Math.max(0, Math.min(86400, v)))
+                }}
+              />
+            </label>
+            <div class="editor-actions">
+              <Show when={props.onRun}>
+                <button type="button" class="btn primary sm" onClick={() => props.onRun!()}><Icon d={icons.play} /> Run now</button>
+              </Show>
+              <Show when={props.onDelete}>
+                <button type="button" class="btn ghost danger sm" onClick={() => props.onDelete!()}><Icon d={icons.trash} /> Delete</button>
+              </Show>
+              <Show when={!readOnly()}>
+                <button type="submit" class="btn primary sm" disabled={busy()}>{busy() ? 'Saving…' : props.recipe ? 'Save changes' : 'Save recipe'}</button>
+              </Show>
+            </div>
           </div>
         </div>
       </div>
@@ -947,19 +917,18 @@ function ServerSecrets(props: { server: Server; onSave: (server: Server, secrets
 }
 
 function ContextMultiSelect(props: { servers: Server[]; selected: string[]; onToggle: (id: string) => void }) {
-  const Option = (optProps: { id: string; title: string; sub: string }) => {
+  const Option = (optProps: { id: string; title: string }) => {
     const checked = () => props.selected.includes(optProps.id)
     return (
-      <button type="button" role="checkbox" aria-checked={checked()} title={`${optProps.title} — ${optProps.sub}`} classList={{ 'ms-option': true, checked: checked() }} onClick={() => props.onToggle(optProps.id)}>
+      <button type="button" role="checkbox" aria-checked={checked()} title={optProps.title} classList={{ 'ms-option': true, checked: checked() }} onClick={() => props.onToggle(optProps.id)}>
         <span class="ms-box"><Show when={checked()}><Icon d={icons.check} size={12} /></Show></span>
         <strong>{optProps.title}</strong>
-        <small class="mono">{optProps.sub}</small>
       </button>
     )
   }
   return (
     <div class="ms-list" role="group" aria-label="Execution context">
-      <For each={props.servers}>{s => <Option id={String(s.id)} title={s.name} sub={isLocalServer(s) ? 'Native Bun on this Debian host' : `${s.username}@${s.host}:${s.port}`} />}</For>
+      <For each={props.servers}>{s => <Option id={String(s.id)} title={s.name} />}</For>
     </div>
   )
 }

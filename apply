@@ -1,6 +1,7 @@
 #!/usr/bin/bash
 set -euo pipefail
 cd web
+npm install
 npm run build
 rm -rf ../cmd/devbox-manager/web
 cp -r dist ../cmd/devbox-manager/web
